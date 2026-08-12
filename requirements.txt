@@ -1,0 +1,13 @@
+# Core (install GDAL via system packages so the Python bindings match your
+# installed libgdal, e.g. `apt install gdal-bin python3-gdal` on Debian/Ubuntu):
+numpy
+scipy
+GDAL
+
+# Optional: enables OmniCloudMask as a second, independent cloud/shadow
+# detector that is combined with the UDM2 mask (see masking.py). Pulls in
+# torch and downloads pretrained weights from huggingface.co on first use.
+# omnicloudmask>=1.0.11
+
+# Dev
+pytest

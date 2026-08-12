@@ -1,0 +1,23 @@
+[project]
+name = "psnorm"
+version = "0.1.0"
+description = "IR-MAD based relative radiometric normalization for PlanetScope imagery"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "GDAL",
+]
+
+[project.optional-dependencies]
+cloudmask = ["omnicloudmask>=1.0.11"]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["psnorm*"]
