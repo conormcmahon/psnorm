@@ -4,6 +4,9 @@ numpy
 scipy
 GDAL
 
+# Used by scripts/sample_points.py for its output dataframe/CSV.
+pandas
+
 # Optional: enables OmniCloudMask as a second, independent cloud/shadow
 # detector that is combined with the UDM2 mask (see masking.py). Pulls in
 # torch and downloads pretrained weights from huggingface.co on first use.
