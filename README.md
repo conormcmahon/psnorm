@@ -1,31 +1,50 @@
 # psnorm
 
-Relative radiometric normalization for PlanetScope imagery: IR-MAD-based
-automatic invariant-pixel selection (in the spirit of ArrNorm), with a
-chunked/resumable/multi-sensor pipeline (in the spirit of spectralmatch).
+Relative radiometric normalization for PlanetScope imagery. Combines elements
+from two existing libraries:
 
-## Why
+[ArrNorm](https://github.com/SMByC/ArrNorm)
+- provides IR-MAD approach for detecting invariant targets
 
-Comparing PlanetScope scenes over time (e.g. to track phenology or tree
-mortality) requires correcting for per-scene radiometric drift — atmosphere,
-sun angle, sensor calibration — without erasing genuine ground change. IR-MAD
-finds pixels that are *jointly* invariant across all bands via canonical
-correlation + iterative chi-square reweighting, which is more robust to real
-land-cover change leaking into the fit than simpler per-band PCA/threshold
+[spectralmatch](https://github.com/spectralmatch/spectralmatch)
+- provides framework for designing pipeline / scaling over large datasets
+- implements 
+
+Also provides a few new tools relative to those approaches:
+- Automated selection of consensus invariant targets across large sets of points,
+  using a combination of thresholded voting and RANSAC outlier rejection when
+  fitting a calibration model (orthogonal least squares).
+
+To do:
+- Build a comparison tool to get external validation of reflectance from the EMIT
+  imaging spectrometer.
+- Continue incremental improvements to scaling design for analyzing large data volumes
+- Optional topographic / surface orientation correction
+- Georegistration (to incorporate [existing experimental library](https://github.com/conormcmahon/planet_georeg_opencv))
+
+## Motivation for Radiometric Normalization
+
+Comparing PlanetScope scenes over time (e.g. to track phenology, land cover change,
+or plant mortality) requires correcting for radiometric drift and errors in surface
+reflectance retrieval — resulting from changing sun angle, mis-estimated atmospheric 
+composition, or degrading sensor performance — without erasing genuine 
+ground change. IR-MAD finds pixels that are *jointly* invariant across all bands 
+via canonical correlation + iterative chi-square reweighting, which is more robust 
+to real land-cover change leaking into the fit than simpler per-band PCA/threshold
 methods.
 
-Invariant-target selection is a three-phase, cross-scene-checked process
-rather than a single pairwise fit — see "How invariant targets are
-selected" below — and every artifact along the way (per-scene exclusion
-masks, per-pair candidates, the final consensus set) is written to disk, not
-just the final gain/offset.
+Invariant-target selection is a three-phase process computed over time series
+rather than a single pairwise fit between two images — see "How invariant 
+targets are selected" below. Every artifact along the way (cloud/water/vegetation
+masks, per-pair candidates, the final consensus set) is written to disk, 
+alongside the final gain/offset.
 
 ## How invariant targets are selected
 
 1. **Phase A — per-target candidate detection.** Each target scene is
    compared to the reference *only* (never target-vs-target) via IR-MAD,
    restricted to pixels that pass that pair's search mask (nodata, water,
-   vegetation, UDM2, and OmniCloudMask all excluded — see Masking below).
+   vegetation, UDM2, and OmniCloudMask excluded — see Masking below).
    Pixels whose no-change probability exceeds `ncp_threshold` (default
    0.70 — user-facing parameter) are flagged as invariant *candidates* for
    that pair and saved as a boolean raster
