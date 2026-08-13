@@ -96,7 +96,14 @@ class BandModel:
     n_invariant_pixels: int
     n_outliers_excluded: int = 0
     rmse_before: float = float("nan")  # target vs reference, at this band's fitted points, before correction
-    rmse_after: float = float("nan")   # target (corrected by slope/intercept) vs reference, same points
+    rmse_after: float = float("nan")   # target (corrected by the *fitted* slope/intercept, i.e. raw_slope/
+                                        # raw_intercept when a fallback happened) vs reference, same points --
+                                        # describes the underlying fit's quality regardless of whether it was
+                                        # actually applied; see identity_fallback for what apply.py actually used
+    identity_fallback: bool = False    # True if slope/intercept below were replaced with the identity transform
+    fallback_reason: str | None = None  # why, e.g. "too few pixels" or "slope outside bounds" -- None if not
+    raw_slope: float | None = None      # the fitted (RANSAC) slope/intercept *before* the fallback decision,
+    raw_intercept: float | None = None  # only populated when identity_fallback is True (else redundant with slope/intercept)
 
 
 @dataclass
@@ -352,6 +359,8 @@ def fit_regression_from_mask(
     block_rows: int = io.DEFAULT_BLOCK_ROWS,
     downsample_factor: int = 1,
     outlier_relative_threshold: float | None = 0.05,
+    slope_bounds: tuple[float, float] | None = (0.8, 1.2),
+    min_fit_pixels: int = 500,
 ) -> NormalizationModel:
     """Per-band orthogonal regression (target -> reference), using only the
     pixels flagged True in `consensus_mask` — the final, cross-scene-checked
@@ -371,8 +380,25 @@ def fit_regression_from_mask(
     is kept rather than switching to OLS), but the outlier criterion is now
     *relative* to the model's own prediction rather than a fixed DN
     difference, so the same threshold is equally strict for a dim road and
-    a bright roof. n_invariant_pixels, r2, and rmse_before/rmse_after on
-    the resulting BandModel all describe the final (post-RANSAC) point set.
+    a bright roof.
+
+    After RANSAC, each band's fit is sanity-checked before it's allowed to
+    be applied: if fewer than `min_fit_pixels` points survived RANSAC, or
+    the fitted slope falls outside `slope_bounds` (either check disabled by
+    passing None), the band falls back to the identity transform
+    (slope=1.0, intercept=0.0) rather than applying an implausible
+    correction -- PlanetScope radiometric drift is expected to be subtle,
+    so a wildly-scaled or negative slope is a sign the fit isn't reliable
+    (too little supporting data, or a spurious RANSAC inlier cluster), not
+    a genuine large correction to make. `identity_fallback`/
+    `fallback_reason` on the resulting BandModel record when and why this
+    happened; `raw_slope`/`raw_intercept` keep the rejected fit around for
+    inspection. `r2`/`rmse_before`/`rmse_after` always describe the
+    underlying *fitted* model's quality (raw_slope/raw_intercept when a
+    fallback occurred) — they're a diagnostic of the fit itself, not of
+    what was actually applied; check `identity_fallback` for that.
+    n_invariant_pixels/n_outliers_excluded describe the post-RANSAC point
+    set regardless of whether the fit was ultimately applied.
     """
     if downsample_factor > 1:
         block_rows = max(downsample_factor, (block_rows // downsample_factor) * downsample_factor)
@@ -429,12 +455,27 @@ def fit_regression_from_mask(
         # set, so the comparison isolates what the correction itself does
         # rather than conflating it with the effect of dropping outliers.
         rmse_before = float(np.sqrt(np.mean((x - y) ** 2)))
-        slope, intercept, r2 = fit_orthogonal_regression(x, y)
-        rmse_after = float(np.sqrt(np.mean((intercept + slope * x - y) ** 2)))
+        fitted_slope, fitted_intercept, r2 = fit_orthogonal_regression(x, y)
+        rmse_after = float(np.sqrt(np.mean((fitted_intercept + fitted_slope * x - y) ** 2)))
+
+        fallback_reason = None
+        if x.size < min_fit_pixels:
+            fallback_reason = f"only {x.size} consensus pixels survived RANSAC (< min_fit_pixels={min_fit_pixels})"
+        elif slope_bounds is not None and not (slope_bounds[0] <= fitted_slope <= slope_bounds[1]):
+            fallback_reason = f"slope {fitted_slope:.4f} outside plausible bounds {slope_bounds}"
+
+        if fallback_reason is not None:
+            slope, intercept = 1.0, 0.0
+            raw_slope, raw_intercept = fitted_slope, fitted_intercept
+        else:
+            slope, intercept = fitted_slope, fitted_intercept
+            raw_slope = raw_intercept = None
 
         band_models.append(BandModel(
             band_name=name, slope=slope, intercept=intercept, r2=r2, n_invariant_pixels=int(x.size),
             n_outliers_excluded=n_outliers, rmse_before=rmse_before, rmse_after=rmse_after,
+            identity_fallback=fallback_reason is not None, fallback_reason=fallback_reason,
+            raw_slope=raw_slope, raw_intercept=raw_intercept,
         ))
 
     return NormalizationModel(

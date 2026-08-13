@@ -235,6 +235,8 @@ class PipelineConfig:
     target_downsample_factor: int  # 1 == disabled; see downsample_targets/downsample_resolution_m
     outlier_relative_threshold: float | None
     use_log_transform: bool
+    slope_bounds: tuple[float, float] | None
+    min_fit_pixels: int
 
 
 @dataclass
@@ -245,6 +247,7 @@ class SceneResult:
     model_path: str | None = None
     normalized_path: str | None = None
     spectral_coverage: list | None = None  # list[normalize.BandSpectralCoverage], see write_spectral_coverage_report
+    n_identity_fallback_bands: int = 0  # bands where the fit was rejected (too few pixels / implausible slope)
 
 
 def _flags_path(output_dir: str, scene_id: str) -> str:
@@ -443,6 +446,7 @@ def _finalize_target_scene(scene: io.Scene, outcome: CandidateOutcome, config: P
             min_observations=config.min_observations, block_rows=config.block_rows,
             downsample_factor=config.target_downsample_factor,
             outlier_relative_threshold=config.outlier_relative_threshold,
+            slope_bounds=config.slope_bounds, min_fit_pixels=config.min_fit_pixels,
         )
     except ValueError as exc:
         return SceneResult(scene.scene_id, "error", message=str(exc))
@@ -467,8 +471,9 @@ def _finalize_target_scene(scene: io.Scene, outcome: CandidateOutcome, config: P
 
     model_io.save_model(full_model, model_path)
     apply.apply_model(scene.analytic_path, full_model, normalized_path, target_band_names, block_rows=config.block_rows)
+    n_identity_fallback_bands = sum(1 for b in full_model.bands if b.identity_fallback)
     return SceneResult(scene.scene_id, "fitted", model_path=model_path, normalized_path=normalized_path,
-                        spectral_coverage=spectral_coverage)
+                        spectral_coverage=spectral_coverage, n_identity_fallback_bands=n_identity_fallback_bands)
 
 
 def _finalize_pair(pair: tuple[io.Scene, CandidateOutcome], config: PipelineConfig) -> SceneResult:
@@ -631,6 +636,8 @@ def run_pipeline(
     downsample_resolution_m: float = 15.0,
     outlier_relative_threshold: float | None = 0.05,
     use_log_transform: bool = True,
+    slope_bounds: tuple[float, float] | None = (0.8, 1.2),
+    min_fit_pixels: int = 500,
     log=print,
 ) -> PipelineResult:
     scenes = io.discover_scenes(input_folder)
@@ -695,6 +702,8 @@ def run_pipeline(
         target_downsample_factor=target_downsample_factor,
         outlier_relative_threshold=outlier_relative_threshold,
         use_log_transform=use_log_transform,
+        slope_bounds=slope_bounds,
+        min_fit_pixels=min_fit_pixels,
     )
     _compute_and_save_flags(reference_scene, band_names, config)
     log(f"Reference exclusion flags: {reference_flags_path}")
@@ -904,12 +913,22 @@ def _render_summary(result: PipelineResult) -> str:
     lines.append(f"- Scenes: {len(result.scene_results)} total — " + ", ".join(f"{k}: {v}" for k, v in status_counts.items()))
     lines.append(f"- Consensus invariant targets: {result.n_consensus_pixels} pixels (reference grid)")
     lines.append(f"- Adjacent pairs: {len(result.pair_reports)} total, {len(compared)} compared ({len(same_day)} same-day, {len(cross_day)} cross-day), {len(excluded)} excluded")
+    fallback_scenes = [r for r in result.scene_results if r.n_identity_fallback_bands > 0]
+    n_fallback_bands = sum(r.n_identity_fallback_bands for r in fallback_scenes)
+    lines.append(f"- Identity-fallback bands (fit rejected as too few pixels / implausible slope): "
+                 f"{n_fallback_bands} band(s) across {len(fallback_scenes)} scene(s) — see model.json fallback_reason")
     lines.append("")
 
     if excluded:
         lines.append("## Excluded pairs")
         for p in excluded:
             lines.append(f"- {p.scene_a} vs {p.scene_b}: {p.excluded_reason}")
+        lines.append("")
+
+    if fallback_scenes:
+        lines.append("## Scenes with identity-fallback bands")
+        for r in fallback_scenes:
+            lines.append(f"- {r.scene_id}: {r.n_identity_fallback_bands} band(s)")
         lines.append("")
 
     if compared:

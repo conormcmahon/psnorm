@@ -69,6 +69,9 @@ just the final gain/offset.
    "Outlier handling" below) excludes consensus pixels the winning model
    can't explain within a relative tolerance, so a handful of contaminated
    points (e.g. cloud/haze leak-through) can't skew an otherwise-good band.
+   The resulting fit is then sanity-checked (`slope_bounds`,
+   `min_fit_pixels` — see "Plausibility guard" below) and rejected in favor
+   of the identity transform if it's implausible or poorly supported.
 
 ## Log-transform (IR-MAD invariant-target detection)
 
@@ -126,6 +129,38 @@ still let that directional bias pull the fit. Pass
 `outlier_relative_threshold=None` to disable this and use every consensus
 pixel as-is.
 
+## Plausibility guard: rejecting implausible fits
+
+Even a well-conditioned RANSAC fit can land on a physically nonsensical
+answer — most often when a scene has too few consensus pixels for RANSAC's
+"most-supported cluster" logic to reliably tell the true relationship apart
+from a coincidentally-tight small subset (empirically, this project's own
+test dataset shows a sharp quality split around ~5000 consensus pixels: at
+or above it, fits are consistently sane; well below it, a meaningful
+fraction land on wildly-scaled or even negative slopes, regardless of
+`outlier_relative_threshold`). PlanetScope radiometric drift is expected to
+be *subtle* — after RANSAC, each band's fit is checked against that prior,
+and rejected (not down-weighted, not partially applied) if it fails:
+
+- **Too little support**: fewer than `min_fit_pixels` (default 500) points
+  survived RANSAC for this band.
+- **Implausible slope**: the fitted slope falls outside `slope_bounds`
+  (default `(0.8, 1.2)`; pass `None` to disable this check).
+
+A rejected band falls back to the **identity transform** (`slope=1.0,
+intercept=0.0`) — i.e. that band is left uncorrected in the output rather
+than having an untrustworthy correction applied. This is a per-band
+decision: one band in a scene can be corrected normally while another in
+the same scene falls back, if only that band's fit is untrustworthy.
+`summary.md` reports a scene-level count of fallback bands, and each
+`BandModel` records the detail:
+
+| field | meaning |
+|---|---|
+| `identity_fallback` | `True` if this band's slope/intercept were replaced with the identity transform |
+| `fallback_reason` | why, e.g. `"only 350 consensus pixels survived RANSAC (< min_fit_pixels=500)"` or `"slope 0.427 outside plausible bounds (0.8, 1.2)"` — `None` if no fallback |
+| `raw_slope`, `raw_intercept` | the rejected RANSAC fit, kept for inspection — `None` when there was no fallback (in which case they'd just duplicate `slope`/`intercept`) |
+
 Every `BandModel` in a saved `models/{scene_id}_model.json` reports, over
 the *final* (post-RANSAC) point set for that band:
 
@@ -133,9 +168,9 @@ the *final* (post-RANSAC) point set for that band:
 |---|---|
 | `n_invariant_pixels` | consensus pixels actually used in the final fit for this band (post-outlier-removal) |
 | `n_outliers_excluded` | how many consensus pixels this band's RANSAC pass dropped |
-| `r2` | fit quality over the final point set |
-| `rmse_before` | target vs. reference RMSE at the final point set, *before* applying slope/intercept |
-| `rmse_after` | same points, *after* applying slope/intercept — isolates what the correction itself does, holding the point set fixed |
+| `r2` | fit quality of the underlying *fitted* model (raw_slope/raw_intercept when a fallback occurred) — a diagnostic of the fit itself, not of what was actually applied |
+| `rmse_before` | target vs. reference RMSE at the final point set, *before* applying the fitted slope/intercept |
+| `rmse_after` | same points, *after* applying the fitted slope/intercept — isolates what the correction itself does, holding the point set fixed. Like `r2`, this describes the underlying fit, not necessarily what was applied — check `identity_fallback` |
 
 **Read `r2` alongside `rmse_before`/`rmse_after`, not in isolation.** Across
 this project's own test dataset, per-band `r2` at the consensus targets is
@@ -241,6 +276,8 @@ result = run_pipeline(
     downsample_targets=False,      # True to search for targets/fit corrections at reduced resolution
     downsample_resolution_m=15.0,  # only used when downsample_targets=True
     outlier_relative_threshold=0.05,  # RANSAC pass, relative-to-prediction threshold; None disables
+    slope_bounds=(0.8, 1.2),   # reject (fall back to identity) fits outside this slope range; None disables
+    min_fit_pixels=500,        # reject (fall back to identity) fits from fewer post-RANSAC points than this
     workers="cpu",
 )
 ```
