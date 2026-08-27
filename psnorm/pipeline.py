@@ -25,7 +25,7 @@ from typing import Literal
 
 import numpy as np
 
-from . import apply, consensus, io, masking, metrics, model_io, normalize, registration, sensors
+from . import apply, backend, consensus, io, masking, metrics, model_io, normalize, registration, sensors
 from .normalize import BandModel
 
 # --------------------------------------------------------------------------
@@ -237,6 +237,7 @@ class PipelineConfig:
     use_log_transform: bool
     slope_bounds: tuple[float, float] | None
     min_fit_pixels: int
+    device: str  # already-resolved "cpu"/"gpu" (see backend.resolve_device) -- Phase A's IR-MAD fit + classify only
 
 
 @dataclass
@@ -262,12 +263,20 @@ def _candidate_stats_path(output_dir: str, target_id: str) -> str:
     return os.path.join(output_dir, "candidates", f"{target_id}_stats.json")
 
 
+def _irmad_fit_path(output_dir: str, target_id: str) -> str:
+    return os.path.join(output_dir, "candidates", f"{target_id}_irmad_fit.json")
+
+
 def _model_path(output_dir: str, scene_id: str) -> str:
     return os.path.join(output_dir, "models", f"{scene_id}_model.json")
 
 
 def _normalized_path(output_dir: str, scene_id: str) -> str:
     return os.path.join(output_dir, "normalized", f"{scene_id}_normalized.tif")
+
+
+def _ransac_inliers_path(output_dir: str, scene_id: str, band_name: str) -> str:
+    return os.path.join(output_dir, "ransac_inliers", f"{scene_id}_{band_name}.tif")
 
 
 def _compute_and_save_flags(scene: io.Scene, band_names: list[str], config: PipelineConfig) -> str:
@@ -299,6 +308,29 @@ def _existing_outputs_reusable(paths: list[str], resume: str) -> bool:
     if resume == "yes":
         return True
     return all(model_io.model_is_valid(p) if p.endswith(".json") else True for p in paths)
+
+
+def _target_model_reusable(model_path: str, normalized_path: str, config: PipelineConfig) -> bool:
+    """Like _existing_outputs_reusable, but additionally invalidated when
+    the saved model was fit under a *different* invariance_frequency_
+    threshold/min_observations than the current config -- both change which
+    pixels are in the consensus mask Phase C fits against (see
+    normalize.NormalizationModel), and Phase B always recomputes the
+    consensus mask fresh every run (no resume check of its own), so a saved
+    model from a differently-thresholded consensus set is stale even though
+    the files themselves still exist and parse. Only meaningful for target
+    scenes -- the reference's own model is always the fixed identity
+    transform regardless of these thresholds."""
+    if not _existing_outputs_reusable([model_path, normalized_path], config.resume):
+        return False
+    try:
+        model = model_io.load_model(model_path)
+    except Exception:
+        return False
+    return (
+        model.invariance_frequency_threshold == config.invariance_frequency_threshold
+        and model.min_observations == config.min_observations
+    )
 
 
 def _process_reference_scene(scene: io.Scene, band_names: list[str], config: PipelineConfig) -> SceneResult:
@@ -365,7 +397,22 @@ def _detect_candidates_for_scene(scene: io.Scene, config: PipelineConfig) -> Can
 
     candidate_path = _candidate_mask_path(config.output_dir, scene.scene_id)
     stats_path = _candidate_stats_path(config.output_dir, scene.scene_id)
-    if config.resume != "no" and os.path.exists(candidate_path) and os.path.exists(stats_path):
+    fit_path = _irmad_fit_path(config.output_dir, scene.scene_id)
+
+    existing_ncp_threshold = None
+    if os.path.exists(stats_path):
+        try:
+            existing_ncp_threshold = model_io.load_json(stats_path).get("ncp_threshold")
+        except Exception:
+            existing_ncp_threshold = None
+
+    if (
+        config.resume != "no"
+        and os.path.exists(candidate_path)
+        and os.path.exists(stats_path)
+        and os.path.exists(fit_path)
+        and existing_ncp_threshold == config.ncp_threshold
+    ):
         return CandidateOutcome(
             scene.scene_id, "detected", ref_window=ref_window, tgt_window=tgt_window,
             target_flags_path=target_flags_path, candidate_mask_path=candidate_path,
@@ -384,6 +431,43 @@ def _detect_candidates_for_scene(scene: io.Scene, config: PipelineConfig) -> Can
     ref_indices = [sensors.band_index(reference_band_names, b) for b in common_bands]
     tgt_indices = [sensors.band_index(target_band_names, b) for b in common_bands]
 
+    # Fast path: a valid fit already exists (from a prior run, possibly at a
+    # different ncp_threshold -- the fit itself doesn't depend on it, only
+    # classification does). Reclassify in one O(pixels) pass instead of
+    # redoing IR-MAD's O(pixels * iterations) iterative fit -- see
+    # normalize.reclassify_invariant_pixels. This assumes the *other*
+    # fit-affecting parameters (log_transform, downsample_factor, max_iter,
+    # conv_threshold) match whatever produced the saved fit; pass
+    # resume="no" to force a full refit if you've changed any of those.
+    if config.resume != "no" and model_io.irmad_fit_is_valid(fit_path):
+        try:
+            fit = model_io.load_irmad_fit(fit_path)
+            invariant_mask, n_evaluated, n_invariant = normalize.reclassify_invariant_pixels(
+                config.reference_analytic_path, target_analytic_path, ref_window, tgt_window,
+                ref_indices, tgt_indices, search_mask, fit,
+                ncp_threshold=config.ncp_threshold, block_rows=config.block_rows,
+                downsample_factor=config.target_downsample_factor, log_transform=config.use_log_transform,
+                device=config.device,
+            )
+        except Exception as exc:
+            return CandidateOutcome(scene.scene_id, "error", message=str(exc))
+
+        masking.save_flags_raster(invariant_mask, io.windowed_raster_info(ref_info, ref_window), candidate_path)
+        model_io.save_json(
+            {
+                "reference_id": config.reference_scene_id, "target_id": scene.scene_id,
+                "ref_window": list(ref_window), "tgt_window": list(tgt_window),
+                "n_evaluated": n_evaluated, "n_invariant": n_invariant,
+                "ncp_threshold": config.ncp_threshold, "irmad_rho": [float(v) for v in fit.rho],
+                "irmad_converged": fit.converged, "irmad_iterations": fit.n_iterations,
+            },
+            stats_path,
+        )
+        return CandidateOutcome(
+            scene.scene_id, "detected", ref_window=ref_window, tgt_window=tgt_window,
+            target_flags_path=target_flags_path, candidate_mask_path=candidate_path,
+        )
+
     try:
         result = normalize.detect_invariant_candidates(
             config.reference_analytic_path, target_analytic_path,
@@ -394,6 +478,7 @@ def _detect_candidates_for_scene(scene: io.Scene, config: PipelineConfig) -> Can
             ncp_threshold=config.ncp_threshold, block_rows=config.block_rows,
             downsample_factor=config.target_downsample_factor,
             log_transform=config.use_log_transform,
+            device=config.device,
         )
     except Exception as exc:
         return CandidateOutcome(scene.scene_id, "error", message=str(exc))
@@ -409,6 +494,10 @@ def _detect_candidates_for_scene(scene: io.Scene, config: PipelineConfig) -> Can
         },
         stats_path,
     )
+    # Saved separately from stats.json (which is a diagnostics summary) since
+    # this is the actual fitted model -- see model_io.save_irmad_fit for why
+    # persisting it is what makes re-sweeping ncp_threshold later cheap.
+    model_io.save_irmad_fit(result.irmad_fit, fit_path)
 
     return CandidateOutcome(
         scene.scene_id, "detected", ref_window=ref_window, tgt_window=tgt_window,
@@ -424,8 +513,15 @@ def _detect_candidates_for_scene(scene: io.Scene, config: PipelineConfig) -> Can
 def _finalize_target_scene(scene: io.Scene, outcome: CandidateOutcome, config: PipelineConfig) -> SceneResult:
     model_path = _model_path(config.output_dir, scene.scene_id)
     normalized_path = _normalized_path(config.output_dir, scene.scene_id)
-    if _existing_outputs_reusable([model_path, normalized_path], config.resume):
-        return SceneResult(scene.scene_id, "resumed", model_path=model_path, normalized_path=normalized_path)
+    if _target_model_reusable(model_path, normalized_path, config):
+        # Re-derive the fallback count from the saved model rather than
+        # defaulting to 0 -- summary.md's tally otherwise silently omits
+        # every resumed scene's fallback bands (only freshly-fitted scenes
+        # would ever contribute to it), undercounting on any run with
+        # resumed scenes in the mix.
+        n_identity_fallback_bands = sum(1 for b in model_io.load_model(model_path).bands if b.identity_fallback)
+        return SceneResult(scene.scene_id, "resumed", model_path=model_path, normalized_path=normalized_path,
+                            n_identity_fallback_bands=n_identity_fallback_bands)
 
     reference_band_names = list(config.reference_band_names)
     target_band_names = sensors.detect_band_names(scene.analytic_path)
@@ -437,7 +533,7 @@ def _finalize_target_scene(scene: io.Scene, outcome: CandidateOutcome, config: P
     consensus_window = masking.load_flags_window(consensus_mask_path, outcome.ref_window) != 0
 
     try:
-        fitted = normalize.fit_regression_from_mask(
+        fitted, inlier_rasters = normalize.fit_regression_from_mask(
             config.reference_analytic_path, scene.analytic_path,
             config.reference_scene_id, scene.scene_id,
             outcome.ref_window, outcome.tgt_window, ref_indices, tgt_indices, common_bands,
@@ -447,9 +543,21 @@ def _finalize_target_scene(scene: io.Scene, outcome: CandidateOutcome, config: P
             downsample_factor=config.target_downsample_factor,
             outlier_relative_threshold=config.outlier_relative_threshold,
             slope_bounds=config.slope_bounds, min_fit_pixels=config.min_fit_pixels,
+            return_inlier_masks=True,
         )
     except ValueError as exc:
         return SceneResult(scene.scene_id, "error", message=str(exc))
+
+    # One binary raster per band showing RANSAC's final inlier pixels for
+    # that band's fit (saved regardless of identity_fallback -- see
+    # fit_regression_from_mask's docstring for why a rejected band's inliers
+    # are still worth inspecting).
+    ref_info = io.get_raster_info(config.reference_analytic_path)
+    for band_name, inlier_mask in inlier_rasters.items():
+        masking.save_flags_raster(
+            inlier_mask, io.windowed_raster_info(ref_info, outcome.ref_window),
+            _ransac_inliers_path(config.output_dir, scene.scene_id, band_name),
+        )
 
     # Spectral-range coverage diagnostic: always computed from native-
     # resolution pixel values (see compute_spectral_coverage), independent
@@ -638,12 +746,23 @@ def run_pipeline(
     use_log_transform: bool = True,
     slope_bounds: tuple[float, float] | None = (0.8, 1.2),
     min_fit_pixels: int = 500,
+    device: Literal["auto", "cpu", "gpu"] = "auto",
     log=print,
 ) -> PipelineResult:
     scenes = io.discover_scenes(input_folder)
     if not scenes:
         raise ValueError(f"No scenes found in '{input_folder}'.")
     log(f"Discovered {len(scenes)} scenes.")
+
+    resolved_device = backend.resolve_device(device)
+    log(f"Device: {resolved_device}" + (f" (auto-detected from device={device!r})" if device == "auto" else ""))
+    if resolved_device == "gpu" and workers not in (1, None):
+        log(
+            f"  note: workers={workers!r} with device='gpu' means multiple CPU processes will "
+            f"each independently use the one GPU for Phase A -- they'll contend for it rather "
+            f"than getting N-way speedup the way CPU-only workers do. Consider workers=1 (or a "
+            f"small number) when device='gpu'/'auto' resolves to gpu."
+        )
 
     reference_scene = select_reference(
         scenes, reference_path=reference_path, zenith_percentile=zenith_percentile,
@@ -659,7 +778,7 @@ def run_pipeline(
         band_names = sensors.detect_band_names(reference_scene.analytic_path)
     log(f"Reference band names: {band_names}")
 
-    for sub in ("masks", "candidates", "consensus", "models", "normalized"):
+    for sub in ("masks", "candidates", "consensus", "models", "normalized", "ransac_inliers"):
         os.makedirs(os.path.join(output_folder, sub), exist_ok=True)
 
     # Downsampling (if enabled) only coarsens the pixel values IR-MAD/the
@@ -704,6 +823,7 @@ def run_pipeline(
         use_log_transform=use_log_transform,
         slope_bounds=slope_bounds,
         min_fit_pixels=min_fit_pixels,
+        device=resolved_device,
     )
     _compute_and_save_flags(reference_scene, band_names, config)
     log(f"Reference exclusion flags: {reference_flags_path}")

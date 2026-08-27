@@ -17,7 +17,7 @@ from datetime import datetime
 import numpy as np
 from scipy import stats
 
-from . import io, irmad, masking
+from . import backend, io, irmad, masking
 
 
 def select_invariant_pixels(chisqr: np.ndarray, dof: int, ncp_threshold: float) -> np.ndarray:
@@ -162,6 +162,29 @@ class InvariantDetectionResult:
     irmad_rho: list[float]
     irmad_converged: bool
     irmad_iterations: int
+    irmad_fit: "irmad.IrMadFit" = None  # the full fitted model -- see model_io.save_irmad_fit
+
+
+def _classify_from_cache(
+    cache: irmad.CachedWindow, fit: irmad.IrMadFit, dof: int, ncp_threshold: float, xsize: int, ysize: int,
+) -> tuple[np.ndarray, int, int]:
+    """Shared by detect_invariant_candidates (fresh fit) and
+    reclassify_invariant_pixels (saved fit, new threshold): score every
+    cached block against `fit` and threshold at `ncp_threshold`. Touches no
+    disk — `cache` already holds every block's pixel data on whichever
+    device it was read to (see irmad._load_window_cache)."""
+    xp = backend.get_array_module(cache.device)
+    invariant_mask = np.zeros((ysize, xsize), dtype=bool)
+    n_evaluated = 0
+    n_invariant = 0
+    for row_off, n_rows, tile_ref, tile_tgt, keep in cache.blocks:
+        chisqr = backend.to_host(irmad.mad_chisqr(tile_ref, tile_tgt, fit, xp=xp))
+        keep_host = backend.to_host(keep)
+        n_evaluated += int(keep_host.sum())
+        invariant = keep_host & select_invariant_pixels(chisqr, dof, ncp_threshold)
+        n_invariant += int(invariant.sum())
+        invariant_mask[row_off : row_off + n_rows, :] = invariant.reshape(n_rows, xsize)
+    return invariant_mask, n_evaluated, n_invariant
 
 
 def detect_invariant_candidates(
@@ -182,12 +205,21 @@ def detect_invariant_candidates(
     block_rows: int = io.DEFAULT_BLOCK_ROWS,
     downsample_factor: int = 1,
     log_transform: bool = True,
+    device: str = "cpu",
 ) -> InvariantDetectionResult:
     """Fit IR-MAD between reference and target over the given windows, then
     flag pixels whose no-change probability exceeds `ncp_threshold` as
     invariant *candidates*. `search_mask` (nodata/water/cloud excluded,
     see masking.py) gates which pixels IR-MAD is fit on and which pixels are
     eligible to be flagged at all — masked pixels are never candidates.
+
+    The classification pass reuses the exact window data `irmad.fit_irmad`
+    already read for the fit (via `return_cache=True`) rather than reading
+    the window from disk a second time — see irmad.py's module docstring.
+
+    `device` ("cpu"/"gpu"/"auto", already *resolved* — see
+    backend.resolve_device) selects the array backend fit_irmad's iteration
+    and this function's classification pass run on.
 
     `downsample_factor` > 1 both fits IR-MAD and evaluates the chi-square
     statistic against spatially-coarsened pixel values (see
@@ -208,44 +240,19 @@ def detect_invariant_candidates(
     if downsample_factor > 1:
         block_rows = max(downsample_factor, (block_rows // downsample_factor) * downsample_factor)
 
-    fit = irmad.fit_irmad(
+    fit, cache = irmad.fit_irmad(
         reference_path, target_path, ref_window, tgt_window,
         band_indices_ref, band_indices_tgt, search_mask,
         max_iter=max_iter, conv_threshold=conv_threshold, block_rows=block_rows,
         downsample_factor=downsample_factor, log_transform=log_transform,
+        device=device, return_cache=True,
     )
 
     n_bands = len(band_names)
     dof = n_bands  # number of MAD variates == number of bands
+    _, _, xsize, ysize = ref_window
 
-    ref_ds, ref_bands = io.open_bands(reference_path, band_indices_ref)
-    tgt_ds, tgt_bands = io.open_bands(target_path, band_indices_tgt)
-    rxoff, ryoff, xsize, ysize = ref_window
-    txoff, tyoff, _, _ = tgt_window
-
-    invariant_mask = np.zeros((ysize, xsize), dtype=bool)
-    n_evaluated = 0
-    n_invariant = 0
-
-    for row_off, n_rows in io.iter_row_blocks(ysize, block_rows):
-        tile_ref_raw = io.read_block_flat(ref_bands, rxoff, ryoff + row_off, xsize, n_rows, downsample_factor)
-        tile_tgt_raw = io.read_block_flat(tgt_bands, txoff, tyoff + row_off, xsize, n_rows, downsample_factor)
-        mask_block = search_mask[row_off : row_off + n_rows, :].ravel()
-        keep = mask_block & tile_ref_raw.any(axis=1) & tile_tgt_raw.any(axis=1)
-        n_evaluated += int(keep.sum())
-
-        if log_transform:
-            tile_ref = irmad._log_transform_tile(tile_ref_raw)
-            tile_tgt = irmad._log_transform_tile(tile_tgt_raw)
-        else:
-            tile_ref, tile_tgt = tile_ref_raw, tile_tgt_raw
-
-        chisqr = irmad.mad_chisqr(tile_ref, tile_tgt, fit)
-        invariant = keep & select_invariant_pixels(chisqr, dof, ncp_threshold)
-        n_invariant += int(invariant.sum())
-        invariant_mask[row_off : row_off + n_rows, :] = invariant.reshape(n_rows, xsize)
-
-    ref_ds = tgt_ds = None
+    invariant_mask, n_evaluated, n_invariant = _classify_from_cache(cache, fit, dof, ncp_threshold, xsize, ysize)
 
     return InvariantDetectionResult(
         reference_id=reference_id,
@@ -259,7 +266,95 @@ def detect_invariant_candidates(
         irmad_rho=[float(v) for v in fit.rho],
         irmad_converged=fit.converged,
         irmad_iterations=fit.n_iterations,
+        irmad_fit=fit,
     )
+
+
+def load_reclassification_cache(
+    reference_path: str,
+    target_path: str,
+    ref_window: io.Window,
+    tgt_window: io.Window,
+    band_indices_ref: list[int],
+    band_indices_tgt: list[int],
+    search_mask: np.ndarray,
+    *,
+    block_rows: int = io.DEFAULT_BLOCK_ROWS,
+    downsample_factor: int = 1,
+    log_transform: bool = True,
+    device: str = "cpu",
+) -> irmad.CachedWindow:
+    """One-time read of a scene's window, for `reclassify_from_cache` calls
+    against many different `ncp_threshold` values without re-reading the
+    window once per threshold (see scripts/sweep_thresholds.py, which sweeps
+    a whole grid of thresholds per scene — reading each scene's window once
+    and reusing it, rather than once per threshold, is a 1/n_thresholds
+    reduction in disk I/O for the exact same result, and matters more than
+    it might look on a slow or flaky filesystem)."""
+    if downsample_factor > 1:
+        block_rows = max(downsample_factor, (block_rows // downsample_factor) * downsample_factor)
+
+    xp = backend.get_array_module(device)
+    rxoff, ryoff, xsize, ysize = ref_window
+    txoff, tyoff, _, _ = tgt_window
+
+    ref_ds, ref_bands = io.open_bands(reference_path, band_indices_ref)
+    tgt_ds, tgt_bands = io.open_bands(target_path, band_indices_tgt)
+    cache = irmad._load_window_cache(
+        ref_bands, tgt_bands, rxoff, ryoff, txoff, tyoff, xsize, ysize, search_mask,
+        block_rows=block_rows, downsample_factor=downsample_factor,
+        log_transform=log_transform, xp=xp,
+    )
+    ref_ds = tgt_ds = None
+    return cache
+
+
+def reclassify_from_cache(
+    cache: irmad.CachedWindow, fit: irmad.IrMadFit, band_indices_ref: list[int], ncp_threshold: float,
+    xsize: int, ysize: int,
+) -> tuple[np.ndarray, int, int]:
+    """Classify against an already-loaded `cache` (see
+    load_reclassification_cache) at a given `ncp_threshold` — no disk I/O,
+    just the O(pixels) chi-square/threshold pass. Returns (invariant_mask,
+    n_evaluated, n_invariant), same as detect_invariant_candidates reports."""
+    dof = len(band_indices_ref)
+    return _classify_from_cache(cache, fit, dof, ncp_threshold, xsize, ysize)
+
+
+def reclassify_invariant_pixels(
+    reference_path: str,
+    target_path: str,
+    ref_window: io.Window,
+    tgt_window: io.Window,
+    band_indices_ref: list[int],
+    band_indices_tgt: list[int],
+    search_mask: np.ndarray,
+    fit: irmad.IrMadFit,
+    *,
+    ncp_threshold: float,
+    block_rows: int = io.DEFAULT_BLOCK_ROWS,
+    downsample_factor: int = 1,
+    log_transform: bool = True,
+    device: str = "cpu",
+) -> tuple[np.ndarray, int, int]:
+    """Single-shot convenience wrapper: read a scene's window once (see
+    load_reclassification_cache) and classify it once (see
+    reclassify_from_cache) at one `ncp_threshold`. A caller sweeping *many*
+    thresholds for the same scene should call those two directly instead —
+    calling this function once per threshold re-reads the window every time.
+
+    Only one fresh pass over the window is needed (to get pixel values —
+    the fit itself isn't persisted alongside the raw data, only its small
+    fitted parameters are), so this is O(pixels), not O(pixels *
+    iterations): the expensive iterative covariance/eigensolve refinement
+    that dominates fit_irmad's cost never runs here.
+    """
+    cache = load_reclassification_cache(
+        reference_path, target_path, ref_window, tgt_window, band_indices_ref, band_indices_tgt, search_mask,
+        block_rows=block_rows, downsample_factor=downsample_factor, log_transform=log_transform, device=device,
+    )
+    _, _, xsize, ysize = ref_window
+    return reclassify_from_cache(cache, fit, band_indices_ref, ncp_threshold, xsize, ysize)
 
 
 _RANSAC_MIN_PREDICTION_MAGNITUDE = 1.0  # DN floor on |predicted| before dividing, avoids blowup near 0
@@ -288,7 +383,8 @@ def _ransac_orthogonal_regression(
     max_iterations: int = 300,
     sample_size: int = 12,
     seed: int = 0,
-) -> tuple[np.ndarray, np.ndarray, int]:
+    slope_bounds: tuple[float, float] | None = None,
+) -> tuple[np.ndarray, np.ndarray, int, np.ndarray]:
     """RANSAC-selected inlier (x, y) subset for orthogonal regression.
 
     Repeatedly fits a candidate orthogonal-regression line from a small
@@ -301,14 +397,35 @@ def _ransac_orthogonal_regression(
     re-scored against that refined model (a standard RANSAC "polish" step),
     so the minimal-sample candidate doesn't itself become the final answer.
 
-    Returns the trimmed (x, y, n_excluded); the caller does its own final
-    fit_orthogonal_regression on the trimmed arrays to get the reported
-    model. Falls back to no trimming if there are too few points, or if no
-    sampled candidate ever finds a workable model.
+    `slope_bounds`, if given, is enforced *during the search itself*: a
+    sampled candidate whose own slope falls outside `slope_bounds` is
+    skipped outright — never scored, never eligible to become `best_mask` —
+    rather than being allowed to win purely on inlier count. Without this,
+    a scene where cloud-shadow/vegetation-contaminated points outnumber the
+    genuine invariant targets among the consensus set can converge on an
+    implausible-but-well-supported model (e.g. slope near 0), which then
+    gets rejected by the caller's post-hoc plausibility check anyway (see
+    fit_regression_from_mask) — wasting the whole search on an answer that
+    was never going to be used instead of continuing to look for a
+    plausible one. The polish step is gated the same way: if refitting on
+    the winning inlier set would push the slope back out of bounds, the
+    polish is discarded and the pre-polish (already-plausible) inliers are
+    kept as the answer instead.
+
+    Returns `(x_trimmed, y_trimmed, n_excluded, inlier_mask)` — `inlier_mask`
+    is a boolean array the same length/order as the *input* x/y, True where
+    that original point survived as a final inlier (so a caller that also
+    has each point's spatial location can recover which pixels were used,
+    e.g. to save a diagnostic raster — see fit_regression_from_mask's
+    `return_inlier_masks`). The caller does its own final
+    fit_orthogonal_regression on `x_trimmed`/`y_trimmed` to get the reported
+    model. Falls back to no trimming (`inlier_mask` all True) if there are
+    too few points, or if no sampled candidate is ever both workable and
+    (when `slope_bounds` is given) plausible.
     """
     n = x.size
     if n < max(6, sample_size):
-        return x, y, 0
+        return x, y, 0, np.ones(n, dtype=bool)
 
     rng = np.random.default_rng(seed)
     best_mask: np.ndarray | None = None
@@ -322,24 +439,43 @@ def _ransac_orthogonal_regression(
             continue
         if not (np.isfinite(slope) and np.isfinite(intercept)):
             continue
+        if slope_bounds is not None and not (slope_bounds[0] <= slope <= slope_bounds[1]):
+            continue
         inliers = _ransac_relative_inliers(x, y, slope, intercept, outlier_relative_threshold)
         count = int(inliers.sum())
         if count > best_count:
             best_count = count
             best_mask = inliers
 
-    if best_mask is None or best_count < 2:
-        return x, y, 0
+    # A winning candidate supported by fewer points than it took to define
+    # it (< sample_size) isn't meaningfully "well-supported" -- 2 points
+    # trivially fit a line with r2=1 regardless of how nonsensical the
+    # resulting slope is, so a tiny winning inlier count is a red flag, not
+    # a good answer. This matters more once slope_bounds narrows the
+    # eligible-candidate pool: with fewer candidates competing, a small,
+    # coincidentally-plausible-looking cluster is more likely to end up
+    # "best" by default. Falling back to no-trimming here defers to the
+    # caller's own min_fit_pixels/slope_bounds post-hoc check (see
+    # fit_regression_from_mask), same as the "no candidate ever plausible"
+    # case already does.
+    if best_mask is None or best_count < sample_size:
+        return x, y, 0, np.ones(n, dtype=bool)
 
     # Polish: refit on the winning inlier set, then re-score everyone
-    # against that refined (not minimal-sample) model.
+    # against that refined (not minimal-sample) model -- but only if the
+    # polished slope is still plausible; otherwise keep the pre-polish
+    # (already-plausible) inliers rather than let the polish drift out of
+    # bounds.
     slope1, intercept1, _r2_1 = fit_orthogonal_regression(x[best_mask], y[best_mask])
-    if np.isfinite(slope1) and np.isfinite(intercept1):
+    if (
+        np.isfinite(slope1) and np.isfinite(intercept1)
+        and (slope_bounds is None or (slope_bounds[0] <= slope1 <= slope_bounds[1]))
+    ):
         polished_mask = _ransac_relative_inliers(x, y, slope1, intercept1, outlier_relative_threshold)
-        if polished_mask.sum() >= 2:
+        if polished_mask.sum() >= sample_size:
             best_mask = polished_mask
 
-    return x[best_mask], y[best_mask], int((~best_mask).sum())
+    return x[best_mask], y[best_mask], int((~best_mask).sum()), best_mask
 
 
 def fit_regression_from_mask(
@@ -361,7 +497,8 @@ def fit_regression_from_mask(
     outlier_relative_threshold: float | None = 0.05,
     slope_bounds: tuple[float, float] | None = (0.8, 1.2),
     min_fit_pixels: int = 500,
-) -> NormalizationModel:
+    return_inlier_masks: bool = False,
+) -> NormalizationModel | tuple[NormalizationModel, dict[str, np.ndarray]]:
     """Per-band orthogonal regression (target -> reference), using only the
     pixels flagged True in `consensus_mask` — the final, cross-scene-checked
     invariant target set (see consensus.py), not this pair's own IR-MAD
@@ -382,23 +519,41 @@ def fit_regression_from_mask(
     difference, so the same threshold is equally strict for a dim road and
     a bright roof.
 
-    After RANSAC, each band's fit is sanity-checked before it's allowed to
-    be applied: if fewer than `min_fit_pixels` points survived RANSAC, or
-    the fitted slope falls outside `slope_bounds` (either check disabled by
-    passing None), the band falls back to the identity transform
+    `slope_bounds` is also passed *into* the RANSAC search itself (see
+    _ransac_orthogonal_regression): a candidate model is only eligible to
+    win the search if its own slope is already plausible, so contamination
+    (cloud shadow, vegetation, misregistration) that outnumbers genuine
+    invariant targets among the consensus set can't win by inlier count
+    alone and silently produce an implausible-but-well-supported model —
+    RANSAC keeps searching for a plausible one instead.
+
+    After RANSAC, each band's fit is sanity-checked once more before it's
+    allowed to be applied: if fewer than `min_fit_pixels` points survived
+    RANSAC, or the fitted slope still falls outside `slope_bounds` (either
+    check disabled by passing None) — which can still happen if RANSAC's
+    search never found *any* plausible candidate and fell back to the
+    untrimmed set — the band falls back to the identity transform
     (slope=1.0, intercept=0.0) rather than applying an implausible
-    correction -- PlanetScope radiometric drift is expected to be subtle,
-    so a wildly-scaled or negative slope is a sign the fit isn't reliable
-    (too little supporting data, or a spurious RANSAC inlier cluster), not
-    a genuine large correction to make. `identity_fallback`/
-    `fallback_reason` on the resulting BandModel record when and why this
-    happened; `raw_slope`/`raw_intercept` keep the rejected fit around for
-    inspection. `r2`/`rmse_before`/`rmse_after` always describe the
-    underlying *fitted* model's quality (raw_slope/raw_intercept when a
-    fallback occurred) — they're a diagnostic of the fit itself, not of
-    what was actually applied; check `identity_fallback` for that.
-    n_invariant_pixels/n_outliers_excluded describe the post-RANSAC point
-    set regardless of whether the fit was ultimately applied.
+    correction. `identity_fallback`/`fallback_reason` on the resulting
+    BandModel record when and why this happened; `raw_slope`/`raw_intercept`
+    keep the rejected fit around for inspection. `r2`/`rmse_before`/
+    `rmse_after` always describe the underlying *fitted* model's quality
+    (raw_slope/raw_intercept when a fallback occurred) — they're a
+    diagnostic of the fit itself, not of what was actually applied; check
+    `identity_fallback` for that. n_invariant_pixels/n_outliers_excluded
+    describe the post-RANSAC point set regardless of whether the fit was
+    ultimately applied.
+
+    `return_inlier_masks=True` additionally returns a `{band_name: mask}`
+    dict, one boolean (ysize, xsize) array per band (shaped like
+    `ref_window`, same convention as `consensus_mask`) marking which
+    consensus pixels survived as RANSAC's *final* inlier set for that band
+    — saved regardless of whether the band was ultimately accepted or fell
+    back to identity, so a rejected band's mask is still useful for seeing
+    what RANSAC found (e.g. a small, spatially clustered inlier set is a
+    different failure mode than a large-but-implausible one). When RANSAC
+    is disabled (`outlier_relative_threshold=None`), the mask is just the
+    whole consensus set for that band.
     """
     if downsample_factor > 1:
         block_rows = max(downsample_factor, (block_rows // downsample_factor) * downsample_factor)
@@ -416,15 +571,36 @@ def fit_regression_from_mask(
     # residuals/robust scale, not just accumulated sums.
     tgt_values: list[list[np.ndarray]] = [[] for _ in range(n_bands)]
     ref_values: list[list[np.ndarray]] = [[] for _ in range(n_bands)]
+    # Flat (row*xsize + col) position within ref_window for every collected
+    # point -- shared across all bands (built from the same `invariant`
+    # selection each block), only materialized when the caller wants inlier
+    # rasters back. Lets a band's final RANSAC inlier_mask (an index into
+    # this same per-band point ordering) be mapped back to actual pixel
+    # locations for return_inlier_masks.
+    positions: list[np.ndarray] = []
     n_consensus_pixels = 0
+
+    # See irmad._load_window_cache's identical pattern: computed once from
+    # the reference window so every target scene's coarse-cell grid lands
+    # at the same absolute positions on the reference grid, not phased
+    # independently per scene (see io.read_block_flat's docstring).
+    x_phase = rxoff % downsample_factor if downsample_factor > 1 else 0
+    y_phase = ryoff % downsample_factor if downsample_factor > 1 else 0
 
     for row_off, n_rows in io.iter_row_blocks(ysize, block_rows):
         invariant = consensus_mask[row_off : row_off + n_rows, :].ravel()
         if not invariant.any():
             continue
-        tile_ref = io.read_block_flat(ref_bands, rxoff, ryoff + row_off, xsize, n_rows, downsample_factor)
-        tile_tgt = io.read_block_flat(tgt_bands, txoff, tyoff + row_off, xsize, n_rows, downsample_factor)
+        tile_ref = io.read_block_flat(
+            ref_bands, rxoff, ryoff + row_off, xsize, n_rows, downsample_factor, x_phase, y_phase,
+        )
+        tile_tgt = io.read_block_flat(
+            tgt_bands, txoff, tyoff + row_off, xsize, n_rows, downsample_factor, x_phase, y_phase,
+        )
         n_consensus_pixels += int(invariant.sum())
+        if return_inlier_masks:
+            block_start = row_off * xsize
+            positions.append(np.arange(block_start, block_start + n_rows * xsize)[invariant])
         for b in range(n_bands):
             # target is x, reference is y: fits reference = a + b*target,
             # the transform later applied to normalize target scenes.
@@ -442,14 +618,20 @@ def fit_regression_from_mask(
             f"overlap/masking for this scene pair."
         )
 
+    position_concat = np.concatenate(positions) if positions else None
+
     band_models = []
+    inlier_rasters: dict[str, np.ndarray] = {}
     for b, name in enumerate(band_names):
         x = np.concatenate(tgt_values[b])
         y = np.concatenate(ref_values[b])
 
         n_outliers = 0
+        inlier_mask = np.ones(x.size, dtype=bool)
         if outlier_relative_threshold is not None:
-            x, y, n_outliers = _ransac_orthogonal_regression(x, y, outlier_relative_threshold)
+            x, y, n_outliers, inlier_mask = _ransac_orthogonal_regression(
+                x, y, outlier_relative_threshold, slope_bounds=slope_bounds,
+            )
 
         # before/after both computed over the same final (post-trim) point
         # set, so the comparison isolates what the correction itself does
@@ -478,7 +660,13 @@ def fit_regression_from_mask(
             raw_slope=raw_slope, raw_intercept=raw_intercept,
         ))
 
-    return NormalizationModel(
+        if return_inlier_masks:
+            raster = np.zeros((ysize, xsize), dtype=bool)
+            inlier_positions = position_concat[inlier_mask]
+            raster.ravel()[inlier_positions] = True
+            inlier_rasters[name] = raster
+
+    model = NormalizationModel(
         reference_id=reference_id,
         target_id=target_id,
         band_names=list(band_names),
@@ -487,6 +675,9 @@ def fit_regression_from_mask(
         invariance_frequency_threshold=invariance_frequency_threshold,
         min_observations=min_observations,
     )
+    if return_inlier_masks:
+        return model, inlier_rasters
+    return model
 
 
 @dataclass

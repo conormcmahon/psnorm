@@ -3,7 +3,9 @@
 adjacent-pair R^2/RMSE before/after summary.
 
 Usage:
-    .venv/bin/python scripts/run_test_images.py [--no-omnicloudmask] [--workers N]
+    .venv/bin/python scripts/run_test_images.py [--no-omnicloudmask] [--workers N] [--device auto|cpu|gpu] \\
+        [--ncp-threshold F] [--invariance-frequency-threshold F] \\
+        [--downsample-targets] [--downsample-resolution-m F]
 """
 
 import argparse
@@ -27,6 +29,13 @@ def main():
     parser.add_argument("--no-omnicloudmask", action="store_true")
     parser.add_argument("--workers", default="cpu")
     parser.add_argument("--resume", default="validate", choices=["no", "yes", "validate"])
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"])
+    parser.add_argument("--ncp-threshold", type=float, default=0.70)
+    parser.add_argument("--invariance-frequency-threshold", type=float, default=0.5)
+    parser.add_argument("--reference-path", default=None, help="force this scene as reference (skips auto-selection)")
+    parser.add_argument("--downsample-targets", action="store_true",
+                         help="search for targets / fit correction factors at reduced resolution (see --downsample-resolution-m)")
+    parser.add_argument("--downsample-resolution-m", type=float, default=15.0)
     args = parser.parse_args()
 
     workers = args.workers
@@ -42,6 +51,12 @@ def main():
         use_omnicloudmask=not args.no_omnicloudmask,
         workers=workers,
         resume=args.resume,
+        device=args.device,
+        ncp_threshold=args.ncp_threshold,
+        invariance_frequency_threshold=args.invariance_frequency_threshold,
+        reference_path=args.reference_path,
+        downsample_targets=args.downsample_targets,
+        downsample_resolution_m=args.downsample_resolution_m,
     )
     elapsed = time.time() - start
 

@@ -133,6 +133,39 @@ nor the target scene is ground truth, both carry error, so a total-least-
 squares fit is kept rather than switching to OLS (which would implicitly
 treat the reference as error-free).
 
+**`slope_bounds` is enforced during the search itself**, not just as a
+post-hoc check (see "Plausibility guard" below): a candidate whose own
+slope falls outside `slope_bounds` is never scored or eligible to win,
+regardless of how many points it would otherwise explain. This matters
+specifically when contamination (cloud shadow, vegetation, misregistration
+bleed) outnumbers the genuine invariant pixels within a scene's consensus
+set — without this, RANSAC's "most-supported" logic has no way to prefer a
+smaller-but-plausible cluster over a larger-but-implausible one, and can
+converge on and report an implausible answer that the post-hoc plausibility
+check then has to reject, wasting the whole search on an answer that was
+never going to be used. With plausibility folded into the search, RANSAC
+keeps looking until it finds a plausible, well-supported model or
+exhausts its iteration budget — in which case it falls back to the
+untrimmed consensus set, same as the too-few-points case, and the caller's
+post-hoc check (unchanged) still catches it. A winning candidate must also
+be supported by at least as many inlier points as the minimal sample used
+to fit it (`sample_size`, default 12) — a 2-point "winner" trivially fits a
+line with r²=1 no matter how nonsensical the resulting slope is, which
+becomes more likely to surface once plausibility-gating narrows the
+eligible-candidate pool.
+
+**`ransac_inliers/{scene_id}_{band}.tif`** (one boolean raster per band,
+on the reference grid, same convention as `consensus/consensus_mask.tif`)
+records exactly which consensus pixels survived as RANSAC's final inlier
+set for that band — written for every band regardless of whether it was
+ultimately accepted or fell back to identity, so a rejected band's raster
+is still useful for seeing *what* RANSAC found (a small, spatially
+clustered inlier set is a different failure mode than a large-but-
+implausible one, and both look different from "found nothing plausible at
+all"). Cross-reference against `identity_fallback`/`fallback_reason` in the
+corresponding `models/{scene_id}_model.json` to see whether that inlier set
+was actually applied.
+
 The outlier criterion is **relative to the model's own prediction**, not a
 fixed DN difference: a point is an outlier if `|observed - predicted| /
 |predicted| > outlier_relative_threshold` (predicted = intercept +
@@ -298,6 +331,7 @@ result = run_pipeline(
     slope_bounds=(0.8, 1.2),   # reject (fall back to identity) fits outside this slope range; None disables
     min_fit_pixels=500,        # reject (fall back to identity) fits from fewer post-RANSAC points than this
     workers="cpu",
+    device="auto",   # "auto"/"cpu"/"gpu" -- see "GPU support" below
 )
 ```
 
@@ -318,6 +352,7 @@ output_folder/
   candidates/{target_id}_stats.json     IR-MAD diagnostics for that candidate fit
   consensus/{times_evaluated,times_invariant,frequency,consensus_mask}.tif
   models/{scene_id}_model.json          final per-band gain/offset
+  ransac_inliers/{scene_id}_{band}.tif  final RANSAC inlier pixels for that band's fit (see "Outlier handling")
   normalized/{scene_id}_normalized.tif  corrected scene (every pixel, unmasked, always native resolution)
   adjacent_pair_report.csv, summary.md
   spectral_coverage_report.csv          per-scene, per-band invariant-target spectral coverage (see below)
@@ -366,18 +401,103 @@ coarsened cell just carries the same smoothed value during fitting). Final
 handful of per-band scalars (slope/intercept), applied to the *original*
 full-resolution scene regardless of how those scalars were derived.
 
+## GPU support
+
+`device` (default `"auto"`) selects the array backend (`numpy` or `cupy`)
+for Phase A's IR-MAD fit and invariant-pixel classification — the only part
+of the pipeline where GPU acceleration is worthwhile (see below for why):
+
+- `"auto"` uses a GPU if `cupy` is importable and reports a usable CUDA
+  device, else falls back to plain CPU/NumPy — silently, since that's the
+  point of "auto".
+- `"gpu"` requires a usable GPU and **raises** if none is found, rather than
+  silently downgrading to CPU — an explicit request that can't be honored
+  should be visible, not quietly slower.
+- `"cpu"` always runs the original NumPy path, regardless of what's
+  available — this is the fallback every other value degrades to, so
+  results (and performance characteristics) on a machine with no GPU are
+  unchanged from before GPU support existed.
+
+Install `cupy` matching your CUDA toolkit (e.g. `pip install cupy-cuda12x`)
+to enable it; nothing else needs to change, and no code imports `cupy`
+unless `device` actually resolves to `"gpu"`.
+
+**What stays on CPU regardless of `device`**: the canonical-correlation
+eigensolve (`irmad._solve_canonical_correlation`) operates on a tiny
+`n_bands x n_bands` matrix (4-8 for PlanetScope) — a GPU solve there would
+be dominated by kernel-launch latency, not compute — and
+`scipy.stats.chi2.sf` (the no-change-probability/reweighting step) has no
+reliably-available GPU equivalent. Both run on small, cheaply-transferred
+arrays each iteration; only the large `(n_pixels, n_bands)` per-pixel work
+(log-transform, the MAD chi-square statistic, weighted-covariance
+accumulation) actually runs on `device`.
+
+**Why only Phase A**: profiling the pipeline's own cost structure (see
+`irmad.py`'s per-iteration streaming and `normalize.fit_regression_from_mask`)
+shows Phase A's IR-MAD fit is the dominant cost — O(scenes × pixels ×
+iterations), with up to 30 iterations per scene — while Phase C's
+regression only touches the (deliberately small) consensus-pixel set and is
+dominated by disk I/O, not per-pixel math. Moving Phase C to GPU wouldn't
+meaningfully change its runtime, so it stays CPU-only.
+
+**Parallelism note**: `workers` (CPU process count) and `device` are
+somewhat in tension — many CPU processes each independently grabbing the
+one GPU will contend for it rather than getting N-way speedup the way
+CPU-only workers do. `run_pipeline` logs a note when `device` resolves to
+`"gpu"` and `workers` isn't 1; consider a small worker count in that case.
+
+### Window caching (why re-running IR-MAD is fast even on CPU)
+
+`irmad.fit_irmad` reads its reference/target window from disk **exactly
+once**, in row-block chunks, and keeps every block resident in memory (or
+on-device, under `device="gpu"`) for however many iterations it takes to
+converge — the iteration loop itself never touches disk again. Without this,
+IR-MAD's own reweighting scheme (re-scoring the same pixels against an
+updated model every iteration) would otherwise re-read — and, for
+compressed source rasters, re-decompress — the same pixels from disk up to
+`max_iter` (default 30) times per scene.
+
+`normalize.detect_invariant_candidates` reuses that same cache (via
+`fit_irmad(..., return_cache=True)`) for its own classification pass
+instead of reading the window a second time, so a full Phase A candidate
+detection touches each pixel's source file exactly once per scene,
+regardless of how many IR-MAD iterations it took to converge.
+
+### Saved IR-MAD fits: cheap `ncp_threshold` sweeps
+
+Every target scene's converged `IrMadFit` (canonical-correlation weights,
+means, sigma — a handful of scalars and small matrices, not pixel data) is
+saved to `candidates/{target_id}_irmad_fit.json` (`model_io.save_irmad_fit`)
+alongside the existing candidate mask and stats — `resume="yes"/"validate"`
+now requires this file to exist too before treating a scene as already
+detected.
+
+This is what makes `ncp_threshold` cheap to re-tune after a run:
+`normalize.reclassify_invariant_pixels` reloads a saved fit and reclassifies
+against a *new* threshold in one O(pixels) pass, skipping IR-MAD's
+expensive O(pixels × iterations) iterative refit entirely (which doesn't
+depend on `ncp_threshold` at all — only the final classification step
+does). `invariance_frequency_threshold`/`min_observations` (Phase B) were
+already cheap to re-sweep this way, since `consensus.aggregate_consensus`
+separates count accumulation from threshold application.
+
+`scripts/sweep_thresholds.py` uses this to sweep `ncp_threshold` x
+`invariance_frequency_threshold` against an already-completed run — see its
+module docstring for usage and the exact metrics it reports.
+
 ## Module map
 
 | module | responsibility |
 |---|---|
 | `sensors.py` | band-name detection (Dove-C/R, SuperDove 4b/8b, ...) |
 | `io.py` | scene discovery, raster metadata, grid alignment/overlap, chunked reads/writes |
+| `backend.py` | GPU/CPU array-backend selection (NumPy/CuPy) — see "GPU support" above |
 | `masking.py` | per-scene exclusion bitmask: nodata + NDWI water + UDM2 + OmniCloudMask |
 | `registration.py` | grid-alignment check (implemented) + co-registration (**stub**, see below) |
 | `irmad.py` | IR-MAD: weighted covariance, canonical correlation, chi-square weighting |
 | `normalize.py` | Phase A candidate detection + Phase C regression-from-consensus-mask |
 | `consensus.py` | Phase B: cross-scene frequency aggregation → final consensus mask |
-| `model_io.py` | save/load fitted models + candidate stats (JSON) — enables resumable runs |
+| `model_io.py` | save/load fitted models, IR-MAD fits, + candidate stats (JSON) — enables resumable runs and cheap threshold re-sweeps |
 | `apply.py` | chunked application of a fitted model to a full scene |
 | `metrics.py` | R²/RMSE agreement between two rasters over a shared mask |
 | `pipeline.py` | orchestration: discover → reference selection → phases A/B/C → adjacency report |

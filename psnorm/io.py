@@ -227,7 +227,10 @@ def nearest_resize(arr, shape: tuple[int, int]):
     return arr[row_idx][:, col_idx]
 
 
-def read_block_flat(bands, xoff: int, yoff: int, xsize: int, n_rows: int, downsample_factor: int = 1):
+def read_block_flat(
+    bands, xoff: int, yoff: int, xsize: int, n_rows: int, downsample_factor: int = 1,
+    x_phase: int | None = None, y_phase: int | None = None,
+):
     """Read an (n_rows*xsize, len(bands)) float64 tile, one column per band.
 
     `downsample_factor` > 1 reads each band downsampled (GDAL-averaged over
@@ -238,6 +241,25 @@ def read_block_flat(bands, xoff: int, yoff: int, xsize: int, n_rows: int, downsa
     window/shape/masking bookkeeping completely unaffected by downsampling —
     only the *values* seen by IR-MAD/regression are coarsened, not the grid
     they're indexed on.
+
+    The coarse-cell grid is anchored to absolute pixel positions
+    `{x_phase, x_phase + downsample_factor, ...}` / `{y_phase, y_phase +
+    downsample_factor, ...}` in *this raster's own* pixel coordinates —
+    NOT to wherever `xoff`/`yoff` happens to start. `x_phase`/`y_phase`
+    default to `xoff % downsample_factor` / `yoff % downsample_factor`
+    (self-consistent for a single window read in isolation), but a caller
+    reading *multiple* windows that need their coarse grids to land at
+    consistent absolute positions relative to each other — e.g. every
+    target scene's window onto the same reference scene, whose windows all
+    start at different `xoff`/`yoff` (see io.overlap_window) — must compute
+    `x_phase`/`y_phase` once (typically from the reference window's own
+    offset) and pass the *same* values into every read, reference and
+    target alike, so a fixed pixel offset between the two is preserved.
+    Without this, each window's coarse grid would be phased independently,
+    and aggregating many targets' contributions onto the reference grid
+    (Phase B's consensus/frequency, or a saved candidate/inlier mask) would
+    show finer-than-`downsample_factor` variation — a patchwork of
+    differently-phased coarse grids rather than one consistent grid.
     """
     import numpy as np
     from osgeo import gdal
@@ -249,16 +271,58 @@ def read_block_flat(bands, xoff: int, yoff: int, xsize: int, n_rows: int, downsa
             tile[:, k] = arr.ravel()
         return tile
 
-    ds_xsize = max(1, xsize // downsample_factor)
-    ds_n_rows = max(1, n_rows // downsample_factor)
+    if x_phase is None:
+        x_phase = xoff % downsample_factor
+    if y_phase is None:
+        y_phase = yoff % downsample_factor
+
+    # Snap the read down/left to the phase-aligned coarse-grid boundary at
+    # or before (xoff, yoff), and round the size up to the next whole
+    # number of coarse cells past (xoff+xsize, yoff+n_rows) -- this is
+    # always >= the originally requested window, cropped back down below.
+    read_xoff = xoff - x_phase
+    read_yoff = yoff - y_phase
+    read_xsize = -(-(x_phase + xsize) // downsample_factor) * downsample_factor
+    read_ysize = -(-(y_phase + n_rows) // downsample_factor) * downsample_factor
+
+    raster_xsize = bands[0].XSize
+    raster_ysize = bands[0].YSize
+    # A shared phase borrowed from another window (see docstring) can push
+    # read_xoff/read_yoff below 0 -- e.g. this window's own xoff is smaller
+    # than the phase value inherited from the reference window. Clamp both
+    # edges independently and pad each side actually missing (off either
+    # end of the raster) with zeros, the same treatment already used for
+    # the trailing edge.
+    clip_left = max(0, -read_xoff)
+    clip_top = max(0, -read_yoff)
+    read_xoff_c = max(read_xoff, 0)
+    read_yoff_c = max(read_yoff, 0)
+    avail_xsize = max(0, min(read_xsize - clip_left, raster_xsize - read_xoff_c))
+    avail_ysize = max(0, min(read_ysize - clip_top, raster_ysize - read_yoff_c))
+    ds_xsize = max(1, avail_xsize // downsample_factor) if avail_xsize > 0 else 1
+    ds_ysize = max(1, avail_ysize // downsample_factor) if avail_ysize > 0 else 1
+
     for k, band in enumerate(bands):
-        small = band.ReadAsArray(
-            xoff, yoff, xsize, n_rows,
-            buf_xsize=ds_xsize, buf_ysize=ds_n_rows,
-            resample_alg=gdal.GRIORA_Average,
-        ).astype(np.float64)
-        big = nearest_resize(small, (n_rows, xsize))
-        tile[:, k] = big.ravel()
+        if avail_xsize > 0 and avail_ysize > 0:
+            small = band.ReadAsArray(
+                read_xoff_c, read_yoff_c, avail_xsize, avail_ysize,
+                buf_xsize=ds_xsize, buf_ysize=ds_ysize,
+                resample_alg=gdal.GRIORA_Average,
+            ).astype(np.float64)
+            big = nearest_resize(small, (avail_ysize, avail_xsize))
+        else:
+            big = np.zeros((0, 0), dtype=np.float64)
+        # Pad back out to the full (read_ysize, read_xsize) phase-aligned
+        # canvas: clip_left/clip_top zeros for pixels off the raster's
+        # leading edge, and whatever's left short of read_xsize/read_ysize
+        # for pixels off its trailing edge.
+        pad_top, pad_left = clip_top, clip_left
+        pad_bottom = max(0, read_ysize - clip_top - big.shape[0])
+        pad_right = max(0, read_xsize - clip_left - big.shape[1])
+        if pad_top or pad_bottom or pad_left or pad_right:
+            big = np.pad(big, ((pad_top, pad_bottom), (pad_left, pad_right)))
+        cropped = big[y_phase : y_phase + n_rows, x_phase : x_phase + xsize]
+        tile[:, k] = cropped.ravel()
     return tile
 
 
