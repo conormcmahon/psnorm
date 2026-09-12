@@ -16,11 +16,12 @@ comparisons:
   times_invariant: subset of times_evaluated where IR-MAD flagged the pixel
                    as an invariant candidate for that comparison
 
-"evaluated" is recomputed here from each scene's saved exclusion-flags
-raster (masking.compute_exclusion_flags), not stored per-pair — so a pixel
-masked out in a given comparison contributes to neither counter for that
-comparison ("don't count masked pixels against a pixel's percentage of
-invariance").
+"evaluated" is recomputed here from each scene's saved *search* mask (the
+eroded/dilated exclusion bitmask pipeline.py saves alongside the raw
+exclusion-flags raster — see pipeline._compute_and_save_flags and
+masking.erode_dilate_bitmask), not stored per-pair — so a pixel masked out
+in a given comparison contributes to neither counter for that comparison
+("don't count masked pixels against a pixel's percentage of invariance").
 """
 
 from __future__ import annotations
@@ -45,8 +46,8 @@ class ConsensusRecord:
     ref_window: io.Window
     tgt_window: io.Window
     candidate_mask_path: str
-    reference_flags_path: str
-    target_flags_path: str
+    reference_search_mask_path: str
+    target_search_mask_path: str
 
 
 @dataclass
@@ -76,8 +77,8 @@ def aggregate_consensus(
 
     for record in records:
         xoff, yoff, xsize, ysize = record.ref_window
-        ref_flags = masking.load_flags_window(record.reference_flags_path, record.ref_window)
-        tgt_flags = masking.load_flags_window(record.target_flags_path, record.tgt_window)
+        ref_flags = masking.load_flags_window(record.reference_search_mask_path, record.ref_window)
+        tgt_flags = masking.load_flags_window(record.target_search_mask_path, record.tgt_window)
         evaluated = (ref_flags == 0) & (tgt_flags == 0)
 
         candidate_dataset, candidate_bands = io.open_bands(record.candidate_mask_path, band_indices=[1])

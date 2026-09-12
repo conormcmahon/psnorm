@@ -274,7 +274,7 @@ for every band under normal fitting — they can diverge in two ways:
 
 ## Masking
 
-Combines five sources into one bitmask raster per scene
+Combines up to eight sources into one bitmask raster per scene
 (`masks/{scene_id}_flags.tif`, saved as the "final cloud/water mask"
 output, each source its own bit so they stay individually recoverable):
 
@@ -285,11 +285,124 @@ output, each source its own bit so they stay individually recoverable):
 | `EXCLUDE_UDM2` (4) | Planet's delivered UDM2 `clear` band | |
 | `EXCLUDE_OMNICLOUD` (8) | [OmniCloudMask](https://github.com/DPIRD-DMA/OmniCloudMask), optional | UDM2 alone is known to miss thin cloud/haze |
 | `EXCLUDE_VEGETATION` (16) | NDVI = (nir-red)/(nir+red) `> ndvi_threshold` | default threshold 0.2; same convention as spectralmatch's PIF vegetation filter — canopy reflectance drifts with phenology/moisture on timescales far shorter than a useful invariant-target baseline |
+| `EXCLUDE_LIDAR_SLOPE` (32) | DSM surface-normal angle `> max_slope_deg`, optional | see "LiDAR/DSM masks" below |
+| `EXCLUDE_LIDAR_ROUGH` (64) | DSM local surface-orientation variability `> roughness_max_deg`, optional | ditto |
+| `EXCLUDE_LIDAR_SHADOW` (128) | DSM shadow ray-trace at this scene's sun position, optional | ditto |
 
-Computed once per scene (not once per pair), so OmniCloudMask/NDWI/NDVI never
-rerun redundantly across the many pairs a scene participates in. Every
-source is independently toggleable (`use_water_mask`, `use_vegetation_mask`,
-`use_omnicloudmask`).
+Computed once per scene (not once per pair), so OmniCloudMask/NDWI/NDVI/LiDAR
+masks never rerun redundantly across the many pairs a scene participates in.
+Every source is independently toggleable (`use_water_mask`,
+`use_vegetation_mask`, `use_omnicloudmask`, `dsm_path`).
+
+### Search mask (erosion/dilation)
+
+`masks/{scene_id}_search_mask.tif` is a second bitmask, derived from
+`_flags.tif` by morphologically opening (eroding then dilating,
+`mask_erode_px`/`mask_dilate_px`, default 1px each) each exclusion reason
+independently — this is what invariant-target search and consensus
+aggregation actually read, not the raw `_flags.tif`. The point is avoiding
+edge effects at exclusion-region boundaries (a mixed pixel straddling a
+cloud edge, a misregistered building edge) without disturbing what reference
+selection, clear-percent reporting, and the adjacent-pair metrics report see
+— those all still read the raw, unmodified `_flags.tif`. Set
+`mask_erode_px=0, mask_dilate_px=0` to make the search mask identical to the
+raw flags.
+
+## LiDAR/DSM masks (optional)
+
+Pass `dsm_path` (a single GeoTIFF, or a directory of tiles — mosaicked via a
+GDAL VRT, no separate merge step needed, and the DSM's own tiling scheme
+doesn't need to match the PlanetScope imagery's) to add three more
+purely-geometric, spectrum-independent exclusion sources. `dsm_path=None`
+(the default) disables all three entirely — nothing DSM-related runs.
+
+```python
+result = run_pipeline(
+    ...,
+    dsm_path="path/to/dsm.tif",       # or a directory of tiles; None disables everything below
+    dsm_height_units="m",             # "m" or "ft" -- vertical unit of the DSM's own pixel values
+    max_slope_deg=5.0,                # horizontality: exclude surface-normal angle > this
+    roughness_window_radius_px=2,     # roughness: local-variability window radius, in DSM pixels
+    roughness_max_deg=10.0,           # roughness: exclude local orientation variability > this
+    use_shadow_mask=False,            # separate opt-in -- ray-tracing is far more expensive than slope/roughness
+    max_building_height_m=150.0,      # shadow: farthest an obstruction this tall could still cast a shadow
+    mask_erode_px=1, mask_dilate_px=1,  # search-mask morphology, see above -- applies regardless of dsm_path
+)
+```
+
+- **Horizontality** (`EXCLUDE_LIDAR_SLOPE`): a target sitting on sloped
+  ground has real BRDF/illumination-geometry effects a single pair of images
+  can't distinguish from genuine radiometric change, so a pixel's IR-MAD
+  "invariance" there is coincidental rather than physically stable. Slope is
+  the DSM's surface-normal angle from vertical (a central-difference
+  gradient).
+- **Roughness** (`EXCLUDE_LIDAR_ROUGH`): the Vector Ruggedness Measure
+  (Sappington et al. 2007) — the angular spread of surface-normal *direction*
+  within a local window, as opposed to slope's *magnitude*. This
+  deliberately does NOT flag a smooth-but-steep slope (every normal points
+  the same way there, so VRM ~ 0) — it flags places where normals point in
+  divergent directions within a small area, the signature of vegetation
+  canopy and building/tree edges rather than merely sloped-but-stable
+  ground.
+- **Shadow** (`EXCLUDE_LIDAR_SHADOW`, opt-in via `use_shadow_mask=True`): a
+  vectorized ray-march (whole-array shift-and-compare per sample distance,
+  not a per-pixel loop) against each scene's own sun position — from
+  metadata.json's `sun_azimuth`/`sun_elevation` if present, else computed
+  from acquisition time (always UTC) + scene centroid lat/lon via the same
+  NOAA solar-position formula `pipeline.sun_zenith_angle_for_scene` already
+  used for reference selection. Cost scales with
+  `max_building_height_m / tan(elevation) / ray_step_m` samples per pixel —
+  `shadow_ray_step_m` (coarsen the march) trades accuracy for speed.
+  Processed in row-blocks (`lidar_masks.compute_and_cache_shadow`), each
+  padded by a halo covering the full search radius, so peak memory is
+  bounded regardless of how large the shared window is — a genuinely
+  necessary fix, not just an optimization: a single whole-array shadow
+  computation over a multi-scene union window caused a real OOM in
+  production (see git history). Unlike slope/roughness,
+  `shadow_downsample_factor` is not supported by this blocked path (would
+  reintroduce the cross-block grid-phase-alignment hazard already solved
+  for `io.read_block_flat` elsewhere in this codebase) — shadow always runs
+  at native DSM resolution for now. The principled fix if this needs to
+  scale past a modest number of scenes/sun-angle buckets is a different
+  algorithm: precompute, once per pixel and independent of any scene's
+  date/time, the horizon angle in a fixed set of azimuth bins (see GRASS
+  GIS `r.horizon`) — a lookup instead of a ray-march, shared across every
+  scene and every year for free. Not implemented here to keep this first
+  pass's scope bounded.
+
+**Cost-sharing across scenes.** Slope/roughness depend only on terrain, so
+they're computed once per pipeline run — over the union of every scene's
+own extent that geometrically overlaps the reference (not just the
+reference's own footprint; a target scene from a different overpass/strip
+commonly extends beyond it, and would otherwise get zero LiDAR coverage in
+the part outside the reference even where the DSM has real data there),
+plus a buffer for the roughness window and for the shadow search radius if
+enabled — and reused for every target scene via a cheap warp-crop onto that
+scene's grid, not recomputed per scene. Shadow masks depend on per-scene sun
+position, but scenes captured close together in time share near-identical
+sun angles, so they're cached to disk under `masks/_lidar_cache/` keyed on a
+rounded `(azimuth, elevation)` bucket
+(`shadow_angle_bucket_deg`, default 1°) and reused by any later scene (or
+worker process, or resumed run) whose sun position rounds to the same
+bucket — a practical first version of a sun-angle lookup table; the
+per-pixel horizon-angle datacube above is the more general version of the
+same idea.
+
+Every mask is computed against the DSM's own native resolution/CRS, not
+resampled down to the coarser PlanetScope grid first (which would blur out
+exactly the small building/canopy edges these masks exist to catch), then
+warped onto each scene's grid with max-resampling — a single flagged DSM
+pixel conservatively excludes whichever (coarser) PlanetScope pixel it falls
+in. Wherever the DSM has no coverage at all, none of the three masks exclude
+anything there (fail-open, the same convention as a missing UDM2 file
+elsewhere in masking.py) rather than assuming the worst.
+
+Diagnostic rasters — useful for judging whether `max_slope_deg`/
+`roughness_max_deg` need retuning against a real scene, since neither has a
+principled "correct" default the way, say, NDVI's 0.2 threshold does —
+are saved per scene alongside the bitmask:
+`masks/{scene_id}_horizontality_flag.tif`, `masks/{scene_id}_roughness_flag.tif`,
+`masks/{scene_id}_unshadowed_flag.tif` (only when `use_shadow_mask=True`).
 
 ## Install
 
@@ -347,7 +460,12 @@ adjacent scene pairs before vs. after normalization
 Output layout:
 ```
 output_folder/
-  masks/{scene_id}_flags.tif            per-scene exclusion bitmask
+  masks/{scene_id}_flags.tif                  per-scene exclusion bitmask (raw, see "Masking")
+  masks/{scene_id}_search_mask.tif            eroded/dilated search mask (see "Search mask")
+  masks/{scene_id}_horizontality_flag.tif     LiDAR: not flat/level (only if dsm_path set)
+  masks/{scene_id}_roughness_flag.tif         LiDAR: locally rough surface (only if dsm_path set)
+  masks/{scene_id}_unshadowed_flag.tif        LiDAR: likely shadowed (only if use_shadow_mask=True)
+  masks/_lidar_cache/                         cached DSM-derived rasters shared across scenes (see "LiDAR/DSM masks")
   candidates/{target_id}_candidate.tif  per-target Phase A invariant candidates
   candidates/{target_id}_stats.json     IR-MAD diagnostics for that candidate fit
   consensus/{times_evaluated,times_invariant,frequency,consensus_mask}.tif

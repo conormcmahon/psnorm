@@ -25,7 +25,7 @@ from typing import Literal
 
 import numpy as np
 
-from . import apply, backend, consensus, io, masking, metrics, model_io, normalize, registration, sensors
+from . import apply, backend, consensus, io, lidar_masks, masking, metrics, model_io, normalize, registration, sensors
 from .normalize import BandModel
 
 # --------------------------------------------------------------------------
@@ -55,10 +55,10 @@ def _acquired_utc(scene: io.Scene) -> datetime | None:
     return scene.acquired
 
 
-def solar_zenith_angle_deg(dt_utc: datetime, lat_deg: float, lon_deg: float) -> float:
-    """Approximate solar zenith angle (degrees) via the standard NOAA solar
-    position formulas (Meeus). Used only as a fallback when a scene's
-    metadata.json doesn't carry `sun_elevation` directly."""
+def _solar_geometry_rad(dt_utc: datetime, lat_deg: float, lon_deg: float) -> tuple[float, float, float]:
+    """(declination_rad, hour_angle_rad, zenith_rad) via the standard NOAA
+    solar position formulas (Meeus). Shared by solar_zenith_angle_deg and
+    solar_position_deg since both need the same intermediate quantities."""
     day_of_year = dt_utc.timetuple().tm_yday
     hour_utc = dt_utc.hour + dt_utc.minute / 60 + dt_utc.second / 3600
 
@@ -85,7 +85,32 @@ def solar_zenith_angle_deg(dt_utc: datetime, lat_deg: float, lon_deg: float) -> 
 
     lat = math.radians(lat_deg)
     cos_zenith = math.sin(lat) * math.sin(decl) + math.cos(lat) * math.cos(decl) * math.cos(hour_angle)
-    return math.degrees(math.acos(max(-1.0, min(1.0, cos_zenith))))
+    zenith = math.acos(max(-1.0, min(1.0, cos_zenith)))
+    return decl, hour_angle, zenith
+
+
+def solar_zenith_angle_deg(dt_utc: datetime, lat_deg: float, lon_deg: float) -> float:
+    """Approximate solar zenith angle (degrees). Used only as a fallback
+    when a scene's metadata.json doesn't carry `sun_elevation` directly."""
+    _decl, _hour_angle, zenith = _solar_geometry_rad(dt_utc, lat_deg, lon_deg)
+    return math.degrees(zenith)
+
+
+def solar_position_deg(dt_utc: datetime, lat_deg: float, lon_deg: float) -> tuple[float, float]:
+    """(azimuth_deg, elevation_deg) -- azimuth measured clockwise from true
+    north, per the standard NOAA solar-position formula. Used as a fallback
+    for lidar_masks.py's shadow ray-trace when a scene's metadata.json
+    doesn't carry `sun_azimuth` directly."""
+    decl, hour_angle, zenith = _solar_geometry_rad(dt_utc, lat_deg, lon_deg)
+    lat = math.radians(lat_deg)
+    denom = math.cos(lat) * math.sin(zenith)
+    if abs(denom) < 1e-9:
+        azimuth_deg = 180.0  # sun at zenith/nadir: azimuth is undefined, pick an arbitrary value
+    else:
+        arg = max(-1.0, min(1.0, (math.sin(lat) * math.cos(zenith) - math.sin(decl)) / denom))
+        base_deg = math.degrees(math.acos(arg))
+        azimuth_deg = (base_deg + 180.0) % 360.0 if hour_angle > 0 else (540.0 - base_deg) % 360.0
+    return azimuth_deg, 90.0 - math.degrees(zenith)
 
 
 def sun_zenith_angle_for_scene(scene: io.Scene) -> float | None:
@@ -103,6 +128,26 @@ def sun_zenith_angle_for_scene(scene: io.Scene) -> float | None:
         return None
     lat, lon = centroid
     return solar_zenith_angle_deg(acquired, lat, lon)
+
+
+def sun_position_for_scene(scene: io.Scene) -> tuple[float, float] | None:
+    """(azimuth_deg, elevation_deg) for `scene`: metadata.json's
+    `sun_azimuth`/`sun_elevation` if both present, else computed from
+    acquisition time + scene centroid lat/lon. None if neither source is
+    available. Acquisition time is always UTC (Planet's `acquired` field and
+    psnorm's filename-parsed timestamps both are), which solar_position_deg
+    requires."""
+    props = scene.metadata().get("properties", {})
+    azimuth, elevation = props.get("sun_azimuth"), props.get("sun_elevation")
+    if azimuth is not None and elevation is not None:
+        return float(azimuth), float(elevation)
+
+    acquired = _acquired_utc(scene)
+    centroid = _scene_centroid_lat_lon(scene)
+    if acquired is None or centroid is None:
+        return None
+    lat, lon = centroid
+    return solar_position_deg(acquired, lat, lon)
 
 
 def select_reference(
@@ -215,6 +260,7 @@ class PipelineConfig:
     reference_scene_id: str
     reference_analytic_path: str
     reference_flags_path: str
+    reference_search_mask_path: str
     reference_band_names: tuple[str, ...]
     output_dir: str
     use_water_mask: bool
@@ -238,6 +284,18 @@ class PipelineConfig:
     slope_bounds: tuple[float, float] | None
     min_fit_pixels: int
     device: str  # already-resolved "cpu"/"gpu" (see backend.resolve_device) -- Phase A's IR-MAD fit + classify only
+    dsm_path: str | None  # None (default) disables every LiDAR-derived mask below entirely
+    dsm_height_units: str  # "m" or "ft" -- vertical unit of the DSM's own pixel values
+    max_slope_deg: float
+    roughness_window_radius_px: int
+    roughness_max_deg: float
+    use_shadow_mask: bool  # separate opt-in from dsm_path -- shadow ray-tracing is far more expensive than slope/roughness
+    max_building_height_m: float
+    shadow_ray_step_m: float | None  # None == one DSM native pixel; coarsen for speed
+    shadow_downsample_factor: int  # 1 == disabled; working resolution for the shadow ray-trace specifically
+    shadow_angle_bucket_deg: float  # sun (azimuth, elevation) rounding granularity for the on-disk shadow-mask cache
+    mask_erode_px: int  # search-mask morphology (see masking.erode_dilate_bitmask) -- 0 disables
+    mask_dilate_px: int
 
 
 @dataclass
@@ -253,6 +311,41 @@ class SceneResult:
 
 def _flags_path(output_dir: str, scene_id: str) -> str:
     return os.path.join(output_dir, "masks", f"{scene_id}_flags.tif")
+
+
+def _search_mask_path(output_dir: str, scene_id: str) -> str:
+    """The eroded/dilated exclusion bitmask (masking.erode_dilate_bitmask)
+    actually used for target/consensus search -- kept separate from
+    `_flags_path` so reference selection, clear-percent reporting, and the
+    adjacent-pair metrics report keep reading the raw, unmodified flags."""
+    return os.path.join(output_dir, "masks", f"{scene_id}_search_mask.tif")
+
+
+def _lidar_flag_path(output_dir: str, scene_id: str, kind: str) -> str:
+    return os.path.join(output_dir, "masks", f"{scene_id}_{kind}_flag.tif")
+
+
+def _lidar_cache_dir(output_dir: str) -> str:
+    return os.path.join(output_dir, "masks", "_lidar_cache")
+
+
+def _lidar_slope_cache_path(output_dir: str) -> str:
+    return os.path.join(_lidar_cache_dir(output_dir), "slope_excluded.tif")
+
+
+def _lidar_roughness_cache_path(output_dir: str) -> str:
+    return os.path.join(_lidar_cache_dir(output_dir), "roughness_excluded.tif")
+
+
+def _lidar_shadow_bucket_key(azimuth_deg: float, elevation_deg: float, bucket_deg: float) -> str:
+    az = round(azimuth_deg / bucket_deg) * bucket_deg
+    el = round(elevation_deg / bucket_deg) * bucket_deg
+    return f"az{az:.1f}_el{el:.1f}"
+
+
+def _lidar_shadow_cache_path(output_dir: str, azimuth_deg: float, elevation_deg: float, bucket_deg: float) -> str:
+    key = _lidar_shadow_bucket_key(azimuth_deg, elevation_deg, bucket_deg)
+    return os.path.join(_lidar_cache_dir(output_dir), f"shadow_excluded_{key}.tif")
 
 
 def _candidate_mask_path(output_dir: str, target_id: str) -> str:
@@ -279,14 +372,26 @@ def _ransac_inliers_path(output_dir: str, scene_id: str, band_name: str) -> str:
     return os.path.join(output_dir, "ransac_inliers", f"{scene_id}_{band_name}.tif")
 
 
-def _compute_and_save_flags(scene: io.Scene, band_names: list[str], config: PipelineConfig) -> str:
+def _compute_and_save_flags(scene: io.Scene, band_names: list[str], config: PipelineConfig) -> tuple[str, str]:
     """Compute (or reuse) a scene's exclusion-flags raster at its own full
-    extent and save it under output_dir/masks/. Shared by the reference and
-    every target so OmniCloudMask/NDWI run exactly once per scene,
-    regardless of how many pairs that scene participates in."""
+    extent and save it under output_dir/masks/, along with the eroded/
+    dilated *search* mask target/consensus search actually reads (see
+    _search_mask_path). Shared by the reference and every target so
+    OmniCloudMask/NDWI/LiDAR masks run exactly once per scene, regardless of
+    how many pairs that scene participates in. Returns (flags_path,
+    search_mask_path).
+    """
     path = _flags_path(config.output_dir, scene.scene_id)
-    if config.resume != "no" and os.path.exists(path):
-        return path
+    search_path = _search_mask_path(config.output_dir, scene.scene_id)
+    if config.resume != "no" and os.path.exists(path) and os.path.exists(search_path):
+        return path, search_path
+
+    info = io.get_raster_info(scene.analytic_path)
+    lidar = _lidar_masks_for_scene(scene, info, config)
+    lidar_slope = lidar["slope"] if lidar else None
+    lidar_rough = lidar["roughness"] if lidar else None
+    lidar_shadow = lidar.get("shadow") if lidar else None
+
     flags = masking.compute_exclusion_flags(
         scene.analytic_path, scene.udm2_path, band_names,
         use_water_mask=config.use_water_mask, ndwi_threshold=config.ndwi_threshold,
@@ -294,10 +399,173 @@ def _compute_and_save_flags(scene: io.Scene, band_names: list[str], config: Pipe
         use_omnicloudmask=config.use_omnicloudmask,
         omnicloud_downsample_factor=config.omnicloud_downsample_factor,
         omnicloud_kwargs=config.omnicloud_kwargs,
+        lidar_slope_excluded=lidar_slope, lidar_rough_excluded=lidar_rough, lidar_shadow_excluded=lidar_shadow,
     )
-    info = io.get_raster_info(scene.analytic_path)
     masking.save_flags_raster(flags, info, path)
-    return path
+
+    if lidar_slope is not None:
+        masking.save_flags_raster(lidar_slope, info, _lidar_flag_path(config.output_dir, scene.scene_id, "horizontality"))
+    if lidar_rough is not None:
+        masking.save_flags_raster(lidar_rough, info, _lidar_flag_path(config.output_dir, scene.scene_id, "roughness"))
+    if lidar_shadow is not None:
+        masking.save_flags_raster(lidar_shadow, info, _lidar_flag_path(config.output_dir, scene.scene_id, "unshadowed"))
+
+    search_flags = masking.erode_dilate_bitmask(
+        flags, masking.ALL_EXCLUDE_BITS, erode_px=config.mask_erode_px, dilate_px=config.mask_dilate_px,
+    )
+    masking.save_flags_raster(search_flags, info, search_path)
+    return path, search_path
+
+
+def _prepare_lidar_masks(scenes: list[io.Scene], reference_scene: io.Scene, config: PipelineConfig, log) -> None:
+    """Precompute (or reuse, if already cached from a prior run) every
+    DSM-derived exclusion mask this run will need, once, before the
+    parallel Phase A dispatch. No-op if config.dsm_path is None.
+
+    Writes GeoTIFFs under output_dir/masks/_lidar_cache/ on the DSM's own
+    native grid/CRS -- slope/roughness depend only on terrain so one
+    raster covers every scene; shadow depends on sun position so one raster
+    per rounded (azimuth, elevation) bucket needed by any scene this run
+    covers. Each worker process is spawned fresh (see _fork_context) and
+    can't share the open GDAL dataset or in-memory arrays built here, so
+    they're written to disk and each worker independently re-opens the tiny
+    crop it needs and warps it onto its own scene's grid -- see
+    _compute_and_save_flags.
+    """
+    if config.dsm_path is None:
+        return
+    cache_dir = _lidar_cache_dir(config.output_dir)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    slope_cache_path = _lidar_slope_cache_path(config.output_dir)
+    roughness_cache_path = _lidar_roughness_cache_path(config.output_dir)
+    need_slope_roughness = config.resume == "no" or not (
+        os.path.exists(slope_cache_path) and os.path.exists(roughness_cache_path)
+    )
+
+    shadow_buckets_needed: dict[str, tuple[float, float]] = {}
+    if config.use_shadow_mask:
+        for scene in scenes:
+            position = sun_position_for_scene(scene)
+            if position is None or position[1] <= 0:
+                continue
+            azimuth, elevation = position
+            key = _lidar_shadow_bucket_key(azimuth, elevation, config.shadow_angle_bucket_deg)
+            shadow_buckets_needed.setdefault(key, (azimuth, elevation))
+        if config.resume != "no":
+            shadow_buckets_needed = {
+                key: pos for key, pos in shadow_buckets_needed.items()
+                if not os.path.exists(
+                    _lidar_shadow_cache_path(config.output_dir, pos[0], pos[1], config.shadow_angle_bucket_deg)
+                )
+            }
+
+    if not need_slope_roughness and not shadow_buckets_needed:
+        log(f"  LiDAR masks: reusing cached slope/roughness/shadow rasters under {cache_dir}")
+        return
+
+    dataset = lidar_masks.open_dsm_mosaic(config.dsm_path)
+    px_m, py_m = lidar_masks.dsm_pixel_size_m(dataset)
+
+    ref_info = io.get_raster_info(reference_scene.analytic_path)
+    # The shared DSM window must cover every scene whose exclusion mask
+    # needs LiDAR coverage, not just the reference -- a target scene
+    # extending beyond the reference's own footprint (as most do, being
+    # different overpasses/strips) would otherwise get zero LiDAR flagging
+    # in the part outside the reference, not because the DSM lacks data
+    # there but because this window was never read that far. Scenes with no
+    # geometric overlap with the reference at all are skipped regardless of
+    # LiDAR (see _detect_candidates_for_scene), so they're excluded from
+    # the union to keep this window from ballooning to cover unrelated
+    # scenes/strips from other days.
+    scene_infos = [ref_info]
+    for scene in scenes:
+        if scene.scene_id == reference_scene.scene_id:
+            continue
+        try:
+            tgt_info = io.get_raster_info(scene.analytic_path)
+        except Exception:
+            continue
+        if io.overlap_window(ref_info, tgt_info) is not None:
+            scene_infos.append(tgt_info)
+    log(f"  LiDAR DSM window covers {len(scene_infos)}/{len(scenes)} scenes "
+        f"(every scene overlapping the reference)...")
+
+    if need_slope_roughness:
+        # Row-blocked (see compute_and_cache_slope_roughness) so peak memory
+        # is bounded by block_rows x width, not by the whole union window --
+        # important now that the window can span many scenes' combined
+        # extent rather than just the reference's own footprint.
+        roughness_buffer_m = config.roughness_window_radius_px * max(px_m, py_m) * 2
+        out_info = lidar_masks.compute_and_cache_slope_roughness(
+            dataset, scene_infos, height_units=config.dsm_height_units, buffer_m=roughness_buffer_m,
+            max_slope_deg=config.max_slope_deg, roughness_window_radius_px=config.roughness_window_radius_px,
+            roughness_max_deg=config.roughness_max_deg,
+            slope_path=slope_cache_path, roughness_path=roughness_cache_path,
+        )
+        if out_info is None:
+            log(f"  WARNING: DSM at '{config.dsm_path}' does not overlap any scene "
+                f"-- horizontality/roughness masks disabled for this run.")
+        else:
+            log(f"  slope/roughness cache: {out_info.width}x{out_info.height} DSM pixels "
+                f"({px_m:.2f}x{py_m:.2f}m native)")
+
+    if shadow_buckets_needed:
+        # Each sun-angle bucket gets its own cached raster (see
+        # _lidar_shadow_cache_path) -- this is the mechanism that actually
+        # handles "different scenes have different sun angles", independent
+        # of how large the shared window is. Row-blocked the same way as
+        # slope/roughness (see compute_and_cache_shadow), just with a much
+        # larger halo -- the full shadow search radius, not a couple
+        # pixels -- since a whole-array shadow computation over a
+        # multi-scene union window is exactly what caused a real OOM in
+        # production.
+        if config.shadow_downsample_factor > 1:
+            log(f"  NOTE: shadow_downsample_factor={config.shadow_downsample_factor} is not "
+                f"supported by the row-blocked shadow computation (avoids reintroducing a "
+                f"cross-block grid-phase-alignment hazard) -- computing at native DSM "
+                f"resolution instead.")
+        for bucket_i, (key, (azimuth, elevation)) in enumerate(shadow_buckets_needed.items(), start=1):
+            log(f"  computing shadow exclusion for sun bucket {key} "
+                f"({bucket_i}/{len(shadow_buckets_needed)}, az={azimuth:.1f} deg, el={elevation:.1f} deg)...")
+            shadow_info = lidar_masks.compute_and_cache_shadow(
+                dataset, scene_infos, height_units=config.dsm_height_units,
+                azimuth_deg=azimuth, elevation_deg=elevation,
+                max_building_height_m=config.max_building_height_m, ray_step_m=config.shadow_ray_step_m,
+                shadow_path=_lidar_shadow_cache_path(config.output_dir, azimuth, elevation, config.shadow_angle_bucket_deg),
+                log=log,
+            )
+            if shadow_info is None:
+                log(f"  WARNING: DSM at '{config.dsm_path}' does not overlap any scene "
+                    f"-- shadow mask for bucket {key} disabled.")
+
+
+def _lidar_masks_for_scene(scene: io.Scene, scene_info: io.RasterInfo, config: PipelineConfig) -> dict[str, np.ndarray] | None:
+    """Warp this scene's crop of each cached DSM-derived exclusion raster
+    (see _prepare_lidar_masks) onto `scene_info`'s exact grid. Returns None
+    if config.dsm_path is None (LiDAR masks disabled) or the cache is
+    missing (DSM didn't overlap the reference extent -- already warned
+    about in _prepare_lidar_masks)."""
+    if config.dsm_path is None:
+        return None
+    slope_cache_path = _lidar_slope_cache_path(config.output_dir)
+    roughness_cache_path = _lidar_roughness_cache_path(config.output_dir)
+    if not (os.path.exists(slope_cache_path) and os.path.exists(roughness_cache_path)):
+        return None
+
+    out = {
+        "slope": lidar_masks.warp_mask_to_scene(slope_cache_path, scene_info),
+        "roughness": lidar_masks.warp_mask_to_scene(roughness_cache_path, scene_info),
+    }
+
+    if config.use_shadow_mask:
+        position = sun_position_for_scene(scene)
+        if position is not None and position[1] > 0:
+            azimuth, elevation = position
+            shadow_cache_path = _lidar_shadow_cache_path(config.output_dir, azimuth, elevation, config.shadow_angle_bucket_deg)
+            if os.path.exists(shadow_cache_path):
+                out["shadow"] = lidar_masks.warp_mask_to_scene(shadow_cache_path, scene_info)
+    return out
 
 
 def _existing_outputs_reusable(paths: list[str], resume: str) -> bool:
@@ -357,7 +625,7 @@ class CandidateOutcome:
     message: str = ""
     ref_window: io.Window | None = None
     tgt_window: io.Window | None = None
-    target_flags_path: str | None = None
+    target_search_mask_path: str | None = None
     candidate_mask_path: str | None = None
 
 
@@ -393,7 +661,7 @@ def _detect_candidates_for_scene(scene: io.Scene, config: PipelineConfig) -> Can
         return CandidateOutcome(scene.scene_id, "skipped_insufficient_overlap", message="no geometric overlap with reference")
     ref_window, tgt_window = window
 
-    target_flags_path = _compute_and_save_flags(scene, target_band_names, config)
+    _target_flags_path, target_search_mask_path = _compute_and_save_flags(scene, target_band_names, config)
 
     candidate_path = _candidate_mask_path(config.output_dir, scene.scene_id)
     stats_path = _candidate_stats_path(config.output_dir, scene.scene_id)
@@ -415,11 +683,11 @@ def _detect_candidates_for_scene(scene: io.Scene, config: PipelineConfig) -> Can
     ):
         return CandidateOutcome(
             scene.scene_id, "detected", ref_window=ref_window, tgt_window=tgt_window,
-            target_flags_path=target_flags_path, candidate_mask_path=candidate_path,
+            target_search_mask_path=target_search_mask_path, candidate_mask_path=candidate_path,
         )
 
-    ref_flags_window = masking.load_flags_window(config.reference_flags_path, ref_window)
-    tgt_flags_window = masking.load_flags_window(target_flags_path, tgt_window)
+    ref_flags_window = masking.load_flags_window(config.reference_search_mask_path, ref_window)
+    tgt_flags_window = masking.load_flags_window(target_search_mask_path, tgt_window)
     search_mask = (ref_flags_window == 0) & (tgt_flags_window == 0)
     n_search = int(search_mask.sum())
     if n_search < config.min_overlap_pixels:
@@ -465,7 +733,7 @@ def _detect_candidates_for_scene(scene: io.Scene, config: PipelineConfig) -> Can
         )
         return CandidateOutcome(
             scene.scene_id, "detected", ref_window=ref_window, tgt_window=tgt_window,
-            target_flags_path=target_flags_path, candidate_mask_path=candidate_path,
+            target_search_mask_path=target_search_mask_path, candidate_mask_path=candidate_path,
         )
 
     try:
@@ -501,7 +769,7 @@ def _detect_candidates_for_scene(scene: io.Scene, config: PipelineConfig) -> Can
 
     return CandidateOutcome(
         scene.scene_id, "detected", ref_window=ref_window, tgt_window=tgt_window,
-        target_flags_path=target_flags_path, candidate_mask_path=candidate_path,
+        target_search_mask_path=target_search_mask_path, candidate_mask_path=candidate_path,
     )
 
 
@@ -747,6 +1015,18 @@ def run_pipeline(
     slope_bounds: tuple[float, float] | None = (0.8, 1.2),
     min_fit_pixels: int = 500,
     device: Literal["auto", "cpu", "gpu"] = "auto",
+    dsm_path: str | None = None,
+    dsm_height_units: str = "m",
+    max_slope_deg: float = 5.0,
+    roughness_window_radius_px: int = 2,
+    roughness_max_deg: float = 10.0,
+    use_shadow_mask: bool = False,
+    max_building_height_m: float = 150.0,
+    shadow_ray_step_m: float | None = None,
+    shadow_downsample_factor: int = 1,
+    shadow_angle_bucket_deg: float = 1.0,
+    mask_erode_px: int = 1,
+    mask_dilate_px: int = 1,
     log=print,
 ) -> PipelineResult:
     scenes = io.discover_scenes(input_folder)
@@ -797,10 +1077,12 @@ def run_pipeline(
     # Reference's own exclusion flags are computed once, up front, since
     # every target comparison reads them.
     reference_flags_path = _flags_path(output_folder, reference_scene.scene_id)
+    reference_search_mask_path = _search_mask_path(output_folder, reference_scene.scene_id)
     config = PipelineConfig(
         reference_scene_id=reference_scene.scene_id,
         reference_analytic_path=reference_scene.analytic_path,
         reference_flags_path=reference_flags_path,
+        reference_search_mask_path=reference_search_mask_path,
         reference_band_names=tuple(band_names),
         output_dir=output_folder,
         use_water_mask=use_water_mask,
@@ -824,7 +1106,24 @@ def run_pipeline(
         slope_bounds=slope_bounds,
         min_fit_pixels=min_fit_pixels,
         device=resolved_device,
+        dsm_path=dsm_path,
+        dsm_height_units=dsm_height_units,
+        max_slope_deg=max_slope_deg,
+        roughness_window_radius_px=roughness_window_radius_px,
+        roughness_max_deg=roughness_max_deg,
+        use_shadow_mask=use_shadow_mask,
+        max_building_height_m=max_building_height_m,
+        shadow_ray_step_m=shadow_ray_step_m,
+        shadow_downsample_factor=shadow_downsample_factor,
+        shadow_angle_bucket_deg=shadow_angle_bucket_deg,
+        mask_erode_px=mask_erode_px,
+        mask_dilate_px=mask_dilate_px,
     )
+    if dsm_path is not None:
+        log(f"Preparing LiDAR masks from DSM '{dsm_path}' "
+            f"(max_slope_deg={max_slope_deg}, roughness_max_deg={roughness_max_deg}, "
+            f"use_shadow_mask={use_shadow_mask})...")
+    _prepare_lidar_masks(scenes, reference_scene, config, log)
     _compute_and_save_flags(reference_scene, band_names, config)
     log(f"Reference exclusion flags: {reference_flags_path}")
 
@@ -847,7 +1146,7 @@ def run_pipeline(
         consensus.ConsensusRecord(
             target_id=scene.scene_id, ref_window=outcome.ref_window, tgt_window=outcome.tgt_window,
             candidate_mask_path=outcome.candidate_mask_path,
-            reference_flags_path=reference_flags_path, target_flags_path=outcome.target_flags_path,
+            reference_search_mask_path=reference_search_mask_path, target_search_mask_path=outcome.target_search_mask_path,
         )
         for scene, outcome in detected
     ]

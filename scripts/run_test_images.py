@@ -36,6 +36,28 @@ def main():
     parser.add_argument("--downsample-targets", action="store_true",
                          help="search for targets / fit correction factors at reduced resolution (see --downsample-resolution-m)")
     parser.add_argument("--downsample-resolution-m", type=float, default=15.0)
+    parser.add_argument("--dsm-path", default=None,
+                         help="optional digital surface model (single file or a directory of tiles) enabling the "
+                              "horizontality/roughness/shadow LiDAR masks; omit to disable them entirely")
+    parser.add_argument("--dsm-height-units", default="m", choices=["m", "ft"])
+    parser.add_argument("--max-slope-deg", type=float, default=5.0)
+    parser.add_argument("--roughness-window-radius-px", type=int, default=2)
+    parser.add_argument("--roughness-max-deg", type=float, default=10.0)
+    parser.add_argument("--use-shadow-mask", action="store_true",
+                         help="also ray-trace each scene's own sun position against the DSM (expensive; opt-in "
+                              "separately from --dsm-path)")
+    parser.add_argument("--max-building-height-m", type=float, default=150.0)
+    parser.add_argument("--shadow-ray-step-m", type=float, default=None,
+                         help="shadow ray-march step size; defaults to one native DSM pixel")
+    parser.add_argument("--shadow-downsample-factor", type=int, default=1,
+                         help="NOT YET SUPPORTED (ignored with a warning; always runs at native resolution) -- "
+                              "was meant as a working-resolution factor for the shadow ray-trace specifically "
+                              "(independent of --downsample-targets), but the row-blocked implementation that "
+                              "keeps shadow masking memory-safe doesn't support it yet")
+    parser.add_argument("--shadow-angle-bucket-deg", type=float, default=1.0,
+                         help="sun (azimuth, elevation) rounding granularity for the on-disk shadow-mask cache")
+    parser.add_argument("--mask-erode-px", type=int, default=1)
+    parser.add_argument("--mask-dilate-px", type=int, default=1)
     args = parser.parse_args()
 
     workers = args.workers
@@ -57,6 +79,18 @@ def main():
         reference_path=args.reference_path,
         downsample_targets=args.downsample_targets,
         downsample_resolution_m=args.downsample_resolution_m,
+        dsm_path=args.dsm_path,
+        dsm_height_units=args.dsm_height_units,
+        max_slope_deg=args.max_slope_deg,
+        roughness_window_radius_px=args.roughness_window_radius_px,
+        roughness_max_deg=args.roughness_max_deg,
+        use_shadow_mask=args.use_shadow_mask,
+        max_building_height_m=args.max_building_height_m,
+        shadow_ray_step_m=args.shadow_ray_step_m,
+        shadow_downsample_factor=args.shadow_downsample_factor,
+        shadow_angle_bucket_deg=args.shadow_angle_bucket_deg,
+        mask_erode_px=args.mask_erode_px,
+        mask_dilate_px=args.mask_dilate_px,
     )
     elapsed = time.time() - start
 

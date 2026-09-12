@@ -31,6 +31,7 @@ import warnings
 
 import numpy as np
 from osgeo import gdal
+from scipy.ndimage import binary_dilation, binary_erosion, generate_binary_structure
 
 from . import io, sensors
 
@@ -41,6 +42,14 @@ EXCLUDE_WATER = 2
 EXCLUDE_UDM2 = 4
 EXCLUDE_OMNICLOUD = 8
 EXCLUDE_VEGETATION = 16
+EXCLUDE_LIDAR_SLOPE = 32     # not flat/level (see lidar_masks.compute_horizontality_excluded)
+EXCLUDE_LIDAR_ROUGH = 64     # locally rough surface orientation (see lidar_masks.compute_roughness_excluded)
+EXCLUDE_LIDAR_SHADOW = 128   # likely shadowed at this scene's sun position (see lidar_masks.compute_shadow_excluded)
+
+ALL_EXCLUDE_BITS = [
+    EXCLUDE_NODATA, EXCLUDE_WATER, EXCLUDE_UDM2, EXCLUDE_OMNICLOUD,
+    EXCLUDE_VEGETATION, EXCLUDE_LIDAR_SLOPE, EXCLUDE_LIDAR_ROUGH, EXCLUDE_LIDAR_SHADOW,
+]
 
 
 def read_udm2_valid_mask(udm2_path: str, window: io.Window) -> np.ndarray:
@@ -199,16 +208,27 @@ def compute_exclusion_flags(
     use_omnicloudmask: bool = True,
     omnicloud_downsample_factor: int = 5,
     omnicloud_kwargs: dict | None = None,
+    lidar_slope_excluded: np.ndarray | None = None,
+    lidar_rough_excluded: np.ndarray | None = None,
+    lidar_shadow_excluded: np.ndarray | None = None,
 ) -> np.ndarray:
     """Bitmask (uint8) over the *entire* scene combining every exclusion
     source, each as its own bit (EXCLUDE_NODATA/WATER/UDM2/OMNICLOUD/
-    VEGETATION) so a saved flags raster keeps each reason individually
-    recoverable. 0 means clear/eligible for invariant-target search.
+    VEGETATION/LIDAR_SLOPE/LIDAR_ROUGH/LIDAR_SHADOW) so a saved flags raster
+    keeps each reason individually recoverable. 0 means clear/eligible for
+    invariant-target search.
 
     Computed once per scene (not once per target-reference pair) — this is
     the shared basis both invariant-target detection and the adjacent-pair
     metrics report read from, and it's what gets persisted as the "final
     cloud mask" output.
+
+    The three `lidar_*_excluded` arrays are optional, pre-warped-to-this-
+    scene's-grid boolean masks from lidar_masks.py (pipeline.py computes
+    these once, since they're DSM/sun-position derived rather than something
+    this function can compute from the analytic image alone) — pass None
+    (the default) for any/all of them to leave that exclusion reason out
+    entirely, which is what happens whenever no DSM was supplied at all.
     """
     info = io.get_raster_info(analytic_path)
     window = (0, 0, info.width, info.height)
@@ -244,7 +264,51 @@ def compute_exclusion_flags(
         if ocm_clear is not None:
             flags |= (~ocm_clear).astype(np.uint8) * EXCLUDE_OMNICLOUD
 
+    if lidar_slope_excluded is not None:
+        flags |= lidar_slope_excluded.astype(np.uint8) * EXCLUDE_LIDAR_SLOPE
+    if lidar_rough_excluded is not None:
+        flags |= lidar_rough_excluded.astype(np.uint8) * EXCLUDE_LIDAR_ROUGH
+    if lidar_shadow_excluded is not None:
+        flags |= lidar_shadow_excluded.astype(np.uint8) * EXCLUDE_LIDAR_SHADOW
+
     return flags
+
+
+def erode_dilate_bitmask(flags: np.ndarray, bit_values: list[int], *, erode_px: int = 1, dilate_px: int = 1) -> np.ndarray:
+    """Morphologically open (erode then dilate) each exclusion reason in
+    `bit_values` independently within the `flags` bitmask, then re-combine.
+    Used to build a *search* mask (see pipeline._compute_and_save_flags,
+    saved separately from the raw `_flags.tif`) that avoids edge effects at
+    exclusion-region boundaries -- e.g. a mixed pixel straddling a cloud
+    edge, or a misregistered building edge -- without disturbing the raw
+    exclusion flags other consumers (reference selection, clear-percent
+    reporting, the adjacent-pair metrics report) read.
+
+    Applied per-plane (rather than to the collapsed "excluded for any
+    reason" boolean) so every pixel's exclusion reason stays individually
+    recoverable, including pixels added back by dilation -- a newly-added
+    pixel keeps exactly the reason(s) whose own shape grew into it, instead
+    of an ambiguous generic "morphology" bit.
+
+    erode_px/dilate_px=0 disables that step (a pure dilation or pure
+    erosion, or a no-op if both are 0) for whichever plane(s) it's applied
+    to. Bits not listed in `bit_values` pass through unmodified.
+    """
+    out = np.zeros_like(flags)
+    structure = generate_binary_structure(2, 1)
+    touched_bits = 0
+    for bit in bit_values:
+        touched_bits |= bit
+        plane = (flags & bit) != 0
+        if erode_px > 0:
+            plane = binary_erosion(plane, structure=structure, iterations=erode_px, border_value=0)
+        if dilate_px > 0:
+            plane = binary_dilation(plane, structure=structure, iterations=dilate_px, border_value=0)
+        out |= plane.astype(flags.dtype) * bit
+    dtype_mask = np.iinfo(flags.dtype).max
+    untouched_mask = flags.dtype.type((~touched_bits) & dtype_mask)
+    out |= flags & untouched_mask
+    return out
 
 
 def save_flags_raster(flags: np.ndarray, raster_info: io.RasterInfo, output_path: str) -> str:
