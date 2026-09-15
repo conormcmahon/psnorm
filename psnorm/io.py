@@ -142,6 +142,74 @@ def discover_scenes(
     return scenes
 
 
+_LOG_SCENE_ID_RE = re.compile(r"^\s{2}(\S+):", re.MULTILINE)
+
+
+def scene_ids_from_log(log_path: str) -> set[str]:
+    """Every scene ID mentioned in a psnorm run log (lines of the form
+    "  {scene_id}: {status}"), read as plain sequential text.
+
+    This exists as an alternative *source of scene IDs* for
+    `discover_scenes_from_ids` on mounts where directory listings
+    (`glob`/`os.listdir`/`os.scandir` -- all backed by the same kernel/
+    virtiofs readdir cache) have been observed to silently return a stale,
+    incomplete snapshot of a large directory's contents, while a direct
+    lookup of a *specific, already-known* path (`os.path.exists`, `open`)
+    against the same directory still resolves correctly. A previous run's
+    own log was written progressively during that run (a plain text
+    append, not a directory listing) and is therefore immune to this
+    failure mode -- so it can serve as the candidate-ID list that
+    `discover_scenes_from_ids` then verifies path-by-path.
+    """
+    with open(log_path) as f:
+        text = f.read()
+    return set(_LOG_SCENE_ID_RE.findall(text))
+
+
+def discover_scenes_from_ids(
+    folder: str,
+    scene_ids: set[str],
+    *,
+    analytic_suffix: str = "_3B_AnalyticMS_SR_harmonized_clip.tif",
+    udm2_suffix: str = "_3B_udm2_clip.tif",
+    metadata_suffix: str = "_metadata.json",
+    log=lambda msg: None,
+) -> list[Scene]:
+    """Like `discover_scenes`, but builds the scene list from an explicit,
+    externally-supplied set of candidate scene IDs (e.g. `scene_ids_from_log`)
+    instead of a directory listing -- each candidate's analytic file is
+    checked with a direct `os.path.exists` (a single-path lookup, not a
+    directory enumeration), so it isn't subject to the stale-readdir-cache
+    failure mode `discover_scenes`'s `glob.glob` can hit on some mounts (see
+    `scene_ids_from_log`'s docstring). Candidates whose analytic file
+    doesn't actually exist are skipped with a log line rather than raising,
+    since the candidate list is inherently just "what a prior source
+    believed existed," not a guarantee.
+    """
+    scenes = []
+    missing = 0
+    for scene_id in sorted(scene_ids):
+        analytic_path = os.path.join(folder, scene_id + analytic_suffix)
+        if not os.path.exists(analytic_path):
+            missing += 1
+            continue
+        udm2_path = os.path.join(folder, scene_id + udm2_suffix)
+        metadata_path = os.path.join(folder, scene_id + metadata_suffix)
+        scenes.append(
+            Scene(
+                scene_id=scene_id,
+                analytic_path=analytic_path,
+                udm2_path=udm2_path if os.path.exists(udm2_path) else None,
+                metadata_path=metadata_path if os.path.exists(metadata_path) else None,
+                acquired=parse_acquisition_time(scene_id),
+            )
+        )
+    if missing:
+        log(f"  {missing}/{len(scene_ids)} candidate scene ID(s) had no analytic file on disk "
+            f"(skipped rather than treated as an error).")
+    return scenes
+
+
 def grids_aligned(a: RasterInfo, b: RasterInfo, tol: float = 1e-6) -> bool:
     """True if `a` and `b` share a CRS, pixel size, and a pixel-integer
     origin offset (i.e. can be overlapped by geotransform arithmetic alone,

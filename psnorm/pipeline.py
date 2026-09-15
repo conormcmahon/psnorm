@@ -18,7 +18,7 @@ from __future__ import annotations
 import csv
 import math
 import os
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Literal
@@ -248,6 +248,220 @@ def select_reference(
         f"percentile filter to 100%. Lower min_reference_area_km2 or pass "
         f"reference_path explicitly."
     )
+
+
+def scene_bounds_map(scenes: list[io.Scene]) -> dict[str, tuple[float, float, float, float]]:
+    """{scene_id: (x0,y0,x1,y1)} for every scene, read once so
+    `select_multi_references`/`assign_scenes_to_references` (and any
+    caller chaining both) don't each re-open every scene's raster header."""
+    return {s.scene_id: io._bounds(io.get_raster_info(s.analytic_path)) for s in scenes}
+
+
+def select_multi_references(
+    scenes: list[io.Scene],
+    *,
+    zenith_percentile: float = 10.0,
+    zenith_percentile_step: float = 10.0,
+    min_reference_area_km2: float = 20.0,
+    use_water_mask: bool = True,
+    ndwi_threshold: float = 0.0,
+    use_vegetation_mask: bool = True,
+    ndvi_threshold: float = 0.2,
+    use_omnicloudmask: bool = True,
+    omnicloud_downsample_factor: int = 5,
+    omnicloud_kwargs: dict | None = None,
+    min_overlap_km2: float = 1.0,
+    max_references: int = 30,
+    scene_bounds: dict[str, tuple[float, float, float, float]] | None = None,
+    log=lambda msg: None,
+) -> list[io.Scene]:
+    """Repeated application of `select_reference`'s own selection criteria
+    -- sun-zenith percentile screen, then rank by clear-sky fraction within
+    that screen, then require `min_reference_area_km2` of actual unmasked
+    (non-nodata/water/cloud/vegetation) area, widening the percentile if
+    nothing clears that bar -- to an AOI wider than any one scene's own
+    strip (e.g. two or more adjacent/overlapping satellite tracks side by
+    side, where no single reference's footprint reaches every target).
+
+    Unlike a plain greedy footprint set-cover, this does NOT pick whichever
+    candidate covers the most remaining scenes -- it picks the *best-
+    quality* candidate (by the same sun-angle + clear-sky + unmasked-area
+    bar `select_reference` uses) among those that cover at least one
+    remaining scene, repeating against whatever's still uncovered until
+    every scene has a reference, `max_references` is hit, or nothing left
+    covers anything further (logged as a warning). A low-quality reference
+    (heavy cloud, oblique sun angle, mostly water/nodata) makes a poor
+    IR-MAD target pool regardless of how much area it covers -- that's
+    exactly the failure mode a coverage-only greedy selection can produce,
+    so quality is the primary criterion here, coverage only a filter on
+    which quality-ranked candidates are even relevant to consider.
+
+    The sun-zenith percentile screen is a free, metadata-only filter
+    (`sun_zenith_angle_for_scene` reads metadata.json or derives from
+    acquisition time + centroid -- no pixel data touched), applied *before*
+    the expensive per-scene mask computation (`compute_exclusion_flags`,
+    which actually opens and analyzes each candidate's pixels for
+    NDVI/water/cloud) -- so that expensive step only ever runs against the
+    scenes the cheap filter already judged relevant, not the full input
+    population. Results are cached across every outer iteration (picking
+    reference #2 doesn't re-examine scenes already scored while picking
+    reference #1), so no candidate's mask is computed more than once here
+    regardless of how many references end up being selected. Note this
+    in-memory computation is separate from (and not shared with) the
+    per-scene flags raster the pipeline itself later computes and caches to
+    disk (`_compute_and_save_flags`) -- that duplication is intentional and
+    was a deliberate tradeoff discussed with the user: the real per-scene
+    flags computation happens during the run regardless of what reference
+    selection does, so skipping the equivalent check here to save compute
+    saves nothing in the end, while measurably degrading which references
+    get picked (fewer/worse consensus targets from a poorly-chosen
+    reference) -- not a trade worth making for a cost that isn't actually
+    avoided.
+    """
+    if not scenes:
+        return []
+
+    ids = [s.scene_id for s in scenes]
+    by_id = {s.scene_id: s for s in scenes}
+    bounds_map = scene_bounds if scene_bounds is not None else scene_bounds_map(scenes)
+    bounds = np.array([bounds_map[sid] for sid in ids])  # (N, 4): x0,y0,x1,y1
+    zeniths = {s.scene_id: sun_zenith_angle_for_scene(s) for s in scenes}
+    zenith_values = np.array([zeniths[sid] if zeniths[sid] is not None else np.inf for sid in ids])
+
+    clear_fraction_cache: dict[str, float] = {}
+
+    def clear_fraction_safe(s: io.Scene) -> float:
+        if s.scene_id not in clear_fraction_cache:
+            try:
+                clear_fraction_cache[s.scene_id] = masking.scene_clear_fraction(s)
+            except Exception:
+                clear_fraction_cache[s.scene_id] = -1.0
+        return clear_fraction_cache[s.scene_id]
+
+    area_cache: dict[str, float] = {}
+
+    def unmasked_area_km2(s: io.Scene) -> float:
+        if s.scene_id not in area_cache:
+            try:
+                band_names = sensors.detect_band_names(s.analytic_path)
+                flags = masking.compute_exclusion_flags(
+                    s.analytic_path, s.udm2_path, band_names,
+                    use_water_mask=use_water_mask, ndwi_threshold=ndwi_threshold,
+                    use_vegetation_mask=use_vegetation_mask, ndvi_threshold=ndvi_threshold,
+                    use_omnicloudmask=use_omnicloudmask, omnicloud_downsample_factor=omnicloud_downsample_factor,
+                    omnicloud_kwargs=omnicloud_kwargs,
+                )
+                info = io.get_raster_info(s.analytic_path)
+                pixel_area_m2 = abs(info.geotransform[1] * info.geotransform[5])
+                area_cache[s.scene_id] = float((flags == 0).sum()) * pixel_area_m2 / 1e6
+            except Exception:
+                area_cache[s.scene_id] = -1.0
+        return area_cache[s.scene_id]
+
+    def overlap_km2_vec(idx: int) -> np.ndarray:
+        """Overlap area (km^2) between scene `idx` and every scene, vectorized."""
+        ax0, ay0, ax1, ay1 = bounds[idx]
+        ox0 = np.maximum(ax0, bounds[:, 0])
+        oy0 = np.maximum(ay0, bounds[:, 1])
+        ox1 = np.minimum(ax1, bounds[:, 2])
+        oy1 = np.minimum(ay1, bounds[:, 3])
+        w = np.maximum(0.0, ox1 - ox0)
+        h = np.maximum(0.0, oy1 - oy0)
+        return (w * h) / 1e6
+
+    remaining = np.ones(len(ids), dtype=bool)
+    selected = np.zeros(len(ids), dtype=bool)
+    references: list[io.Scene] = []
+
+    while remaining.any() and len(references) < max_references:
+        picked_idx, picked_covered = None, None
+        percentile = zenith_percentile
+        while True:
+            threshold = float(np.percentile(zenith_values, percentile))
+            pool = sorted(
+                (i for i in range(len(ids)) if not selected[i] and zenith_values[i] <= threshold),
+                key=lambda i: -clear_fraction_safe(by_id[ids[i]]),
+            )
+            for i in pool:
+                covered = remaining & (overlap_km2_vec(i) >= min_overlap_km2)
+                if not covered.any():
+                    continue  # doesn't help with what's left uncovered -- not worth the expensive area check
+                if unmasked_area_km2(by_id[ids[i]]) >= min_reference_area_km2:
+                    picked_idx, picked_covered = i, covered
+                    break
+            if picked_idx is not None or percentile >= 100.0:
+                break
+            percentile = min(100.0, percentile + zenith_percentile_step)
+
+        if picked_idx is None:
+            # Nothing left clears the quality bar anywhere in the AOI (rare) --
+            # fall back to whichever remaining candidate covers the most
+            # uncovered scenes, same last-resort behavior as before, rather
+            # than leaving those scenes with no reference at all.
+            best_idx, best_count, best_covered = -1, -1, None
+            for i in range(len(ids)):
+                if selected[i]:
+                    continue
+                covered = remaining & (overlap_km2_vec(i) >= min_overlap_km2)
+                count = int(covered.sum())
+                if count > best_count:
+                    best_idx, best_count, best_covered = i, count, covered
+            if best_idx < 0:
+                break
+            picked_idx, picked_covered = best_idx, best_covered
+            log(f"  WARNING: no candidate met the quality bar for the remaining uncovered area; "
+                f"falling back to best-coverage candidate {ids[picked_idx]}.")
+
+        references.append(by_id[ids[picked_idx]])
+        selected[picked_idx] = True
+        remaining &= ~picked_covered
+        log(f"  reference #{len(references)}: {ids[picked_idx]} "
+            f"(clear_fraction={clear_fraction_cache.get(ids[picked_idx], float('nan')):.3f}, "
+            f"unmasked_area={area_cache.get(ids[picked_idx], float('nan')):.1f}km^2) "
+            f"covers {int(picked_covered.sum())} scenes ({int(remaining.sum())} scene(s) still uncovered)")
+
+    if remaining.any():
+        uncovered = [ids[i] for i in np.nonzero(remaining)[0]]
+        log(f"  WARNING: {len(uncovered)} scene(s) have no overlapping reference and will "
+            f"be left un-normalized: {sorted(uncovered)[:10]}{' ...' if len(uncovered) > 10 else ''}")
+
+    return references
+
+
+def assign_scenes_to_references(
+    scenes: list[io.Scene], references: list[io.Scene], *,
+    scene_bounds: dict[str, tuple[float, float, float, float]] | None = None,
+    log=lambda msg: None,
+) -> dict[str, list[io.Scene]]:
+    """{reference_scene_id: [scenes assigned to it]} -- every scene
+    (including the references themselves) is assigned to whichever
+    reference's bounding box it overlaps *most*, so each scene is corrected
+    against exactly one reference even when several references' footprints
+    overlap it. A scene that overlaps no reference at all is dropped (with
+    a warning) rather than assigned arbitrarily.
+    """
+    bounds_map = scene_bounds if scene_bounds is not None else scene_bounds_map(scenes + references)
+    groups: dict[str, list[io.Scene]] = {r.scene_id: [] for r in references}
+    dropped = []
+    for s in scenes:
+        sb = bounds_map[s.scene_id]
+        best_ref, best_area = None, 0.0
+        for r in references:
+            rb = bounds_map[r.scene_id]
+            rid = r.scene_id
+            ox0, oy0 = max(sb[0], rb[0]), max(sb[1], rb[1])
+            ox1, oy1 = min(sb[2], rb[2]), min(sb[3], rb[3])
+            area = max(0.0, ox1 - ox0) * max(0.0, oy1 - oy0)
+            if area > best_area:
+                best_ref, best_area = rid, area
+        if best_ref is None:
+            dropped.append(s.scene_id)
+        else:
+            groups[best_ref].append(s)
+    if dropped:
+        log(f"  WARNING: {len(dropped)} scene(s) overlap no reference and were dropped: "
+            f"{sorted(dropped)[:10]}{' ...' if len(dropped) > 10 else ''}")
+    return groups
 
 
 # --------------------------------------------------------------------------
@@ -881,16 +1095,40 @@ def _fork_context():
     return mp.get_context("spawn")
 
 
-def _map_parallel(fn, items, workers, *extra_args):
+def _map_parallel(fn, items, workers, *extra_args, on_result=None):
+    """[fn(item, *extra_args) for item in items], parallelized across
+    `workers` processes. The returned list is always in the same order as
+    `items`, regardless of completion order.
+
+    `on_result(item, result)`, if given, fires as soon as *that* item's
+    result is available -- in completion order, which on a large batch
+    (hundreds of scenes) can be a very different order than `items` itself.
+    Without it, a caller has no visibility into a batch's progress until
+    every single item has finished: the previous version of this function
+    only ever returned once the whole list was ready, so on a big multi-
+    hour batch there was no sign of life (not even in the log) between
+    "starting" and "done" -- which reads identically to a hang. Passing
+    `on_result` (used by run_pipeline's Phase A/C batches) lets the caller
+    log/count as items complete instead of only once, at the very end.
+    """
     n_workers = _resolve_workers(workers)
     if n_workers is None or n_workers <= 1 or len(items) <= 1:
-        return [fn(item, *extra_args) for item in items]
+        results = []
+        for item in items:
+            r = fn(item, *extra_args)
+            if on_result is not None:
+                on_result(item, r)
+            results.append(r)
+        return results
     ctx = _fork_context()
     results = [None] * len(items)
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
         futures = {executor.submit(fn, item, *extra_args): i for i, item in enumerate(items)}
-        for future in futures:
-            results[futures[future]] = future.result()
+        for future in as_completed(futures):
+            i = futures[future]
+            results[i] = future.result()
+            if on_result is not None:
+                on_result(items[i], results[i])
     return results
 
 
@@ -1027,12 +1265,27 @@ def run_pipeline(
     shadow_angle_bucket_deg: float = 1.0,
     mask_erode_px: int = 1,
     mask_dilate_px: int = 1,
+    scene_ids: set[str] | None = None,
+    scenes: list[io.Scene] | None = None,
     log=print,
 ) -> PipelineResult:
-    scenes = io.discover_scenes(input_folder)
-    if not scenes:
-        raise ValueError(f"No scenes found in '{input_folder}'.")
-    log(f"Discovered {len(scenes)} scenes.")
+    if scenes is not None:
+        log(f"Using {len(scenes)} caller-supplied scenes (bypassing directory discovery).")
+    else:
+        scenes = io.discover_scenes(input_folder)
+        if not scenes:
+            raise ValueError(f"No scenes found in '{input_folder}'.")
+        log(f"Discovered {len(scenes)} scenes.")
+
+    if scene_ids is not None:
+        scenes = [s for s in scenes if s.scene_id in scene_ids]
+        missing = scene_ids - {s.scene_id for s in scenes}
+        if missing:
+            log(f"  WARNING: {len(missing)} requested scene_id(s) not found in '{input_folder}': "
+                f"{sorted(missing)[:10]}{' ...' if len(missing) > 10 else ''}")
+        if not scenes:
+            raise ValueError(f"None of the requested scene_ids were found in '{input_folder}'.")
+        log(f"Restricted to {len(scenes)} scenes (scene_ids filter, e.g. one multi-reference group).")
 
     resolved_device = backend.resolve_device(device)
     log(f"Device: {resolved_device}" + (f" (auto-detected from device={device!r})" if device == "auto" else ""))
@@ -1132,10 +1385,18 @@ def run_pipeline(
 
     targets = [s for s in scenes if s.scene_id != reference_scene.scene_id]
 
-    log("Phase A: detecting invariant-target candidates (target vs. reference only)...")
-    candidate_outcomes = _map_parallel(_detect_candidates_for_scene, targets, workers, config)
-    for scene, outcome in zip(targets, candidate_outcomes):
-        log(f"  {scene.scene_id}: {outcome.status}" + (f" ({outcome.message})" if outcome.message else ""))
+    log(f"Phase A: detecting invariant-target candidates against {len(targets)} target scenes "
+        f"(target vs. reference only)...")
+    n_done = [0]
+
+    def _log_candidate_progress(scene, outcome):
+        n_done[0] += 1
+        log(f"  [{n_done[0]}/{len(targets)}] {scene.scene_id}: {outcome.status}"
+            + (f" ({outcome.message})" if outcome.message else ""))
+
+    candidate_outcomes = _map_parallel(
+        _detect_candidates_for_scene, targets, workers, config, on_result=_log_candidate_progress,
+    )
 
     detected = [(s, o) for s, o in zip(targets, candidate_outcomes) if o.status == "detected"]
 
@@ -1165,10 +1426,15 @@ def run_pipeline(
         consensus_result.consensus_mask, block_rows=block_rows,
     )
 
-    log("Phase C: final regression fit + full-scene apply...")
-    target_results = _map_parallel(_finalize_pair, detected, workers, config)
-    for scene, result in zip([s for s, _ in detected], target_results):
-        log(f"  {scene.scene_id}: {result.status}" + (f" ({result.message})" if result.message else ""))
+    log(f"Phase C: final regression fit + full-scene apply, {len(detected)} scenes...")
+    n_done_c = [0]
+
+    def _log_finalize_progress(pair, result):
+        n_done_c[0] += 1
+        log(f"  [{n_done_c[0]}/{len(detected)}] {pair[0].scene_id}: {result.status}"
+            + (f" ({result.message})" if result.message else ""))
+
+    target_results = _map_parallel(_finalize_pair, detected, workers, config, on_result=_log_finalize_progress)
 
     skipped_results = [
         SceneResult(scene.scene_id, outcome.status, message=outcome.message)
