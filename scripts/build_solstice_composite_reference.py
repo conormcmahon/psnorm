@@ -59,17 +59,22 @@ statistics loop, output writing) lives in psnorm/compositing.py, shared
 with scripts/build_monthly_composites.py -- see that module's docstring
 for the engine's design and the profiling behind the rank-statistic trick.
 
+--workers parallelizes across solstice years (each year's composite is a
+fully independent unit of work, exactly like build_monthly_composites.py's
+--workers parallelizing across months).
+
 Usage:
     .venv/bin/python scripts/build_solstice_composite_reference.py \\
         --raw-root /mnt/e/E_Coast_PlanetScope/philadelphia/raw \\
         --output-dir /mnt/e/E_Coast_PlanetScope/philadelphia/solstice_composite \\
-        --prefix solstice --window-days 14
+        --prefix solstice --window-days 14 --workers 4
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+import multiprocessing
 import os
 import sys
 import time
@@ -89,6 +94,18 @@ FOUR_BAND_SUFFIX = "_3B_AnalyticMS_SR_harmonized_clip.tif"
 EIGHT_BAND_SUFFIX = "_3B_AnalyticMS_SR_8b_harmonized_clip.tif"
 UDM2_SUFFIX = "_3B_udm2_clip.tif"
 CANONICAL_BANDS = sensors.BAND_PROFILES[8]
+
+# A quarter of compositing.py's own default tile area (half block_rows,
+# half block_cols), not that default -- a solstice composite pools scenes
+# across a whole --window-days span (and, under --workers, several of
+# those run concurrently), so it routinely holds far more contributing
+# scenes per tile than build_monthly_composites.py's one-calendar-month
+# scope ever does. The production run across this archive's 9 solstice
+# years (--workers 3 at the full-size default) pushed memory to
+# 9.3GB/11GB with only three concurrent composites; this quarter-size
+# tile kept the same run at a comfortable ~5GB throughout.
+DEFAULT_BLOCK_ROWS = 256
+DEFAULT_BLOCK_COLS = 1024
 
 
 # --------------------------------------------------------------------------
@@ -233,6 +250,49 @@ def group_by_solstice_year(
     return by_year
 
 
+def _process_one_year(
+    year: int, selected: list[tuple[io.Scene, str]],
+    output_dir: str, prefix: str, stats: list[str],
+    block_rows: int, block_cols: int, gdal_cache_mb: int, min_observations: int,
+) -> str:
+    """One composite for one solstice year. Self-contained (takes only
+    picklable Scene/tag tuples, not any shared discovery state) so it can
+    run standalone in a worker process under --workers > 1, as well as
+    in-process for the sequential path -- mirrors
+    build_monthly_composites.py's _process_one_month."""
+    gdal.UseExceptions()
+    gdal.SetCacheMax(gdal_cache_mb * 1024 * 1024)
+
+    log_prefix = f"[pid {os.getpid()}] " if multiprocessing.current_process().name != "MainProcess" else ""
+
+    def log(msg: str) -> None:
+        print(f"{log_prefix}{msg}", flush=True)
+
+    n_4b = sum(1 for _s, tag in selected if tag == "4b")
+    n_8b = sum(1 for _s, tag in selected if tag == "8b")
+    log(f"[{year}] {len(selected)} scene(s) ({n_4b} 4-band, {n_8b} 8-band)")
+
+    resolved = compositing.resolve_scenes(selected, CANONICAL_BANDS, require_all_bands=False, log=log)
+    if not resolved:
+        log(f"  No usable scenes for {year}; skipping.")
+        return str(year)
+
+    output_path = os.path.join(output_dir, f"{prefix}_{year}.tif")
+    compositing.build_composite(
+        resolved, CANONICAL_BANDS, stats, output_path,
+        all_groups=["4b", "8b"],  # fixed band layout even in a year with only one product
+        block_rows=block_rows, block_cols=block_cols, min_observations=min_observations, log=log,
+    )
+    return str(year)
+
+
+def _process_one_year_star(args: tuple) -> str:
+    """multiprocessing.Pool.imap_unordered needs a single-argument callable;
+    this just unpacks the tuple _process_one_year otherwise takes as
+    separate arguments."""
+    return _process_one_year(*args)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--raw-root", default="/mnt/e/E_Coast_PlanetScope/philadelphia/raw")
@@ -241,16 +301,18 @@ def main():
     parser.add_argument("--window-days", type=int, default=14,
                          help="select scenes within this many days of the computed summer "
                               "solstice (default: 14, i.e. 2 weeks)")
-    parser.add_argument("--block-rows", type=int, default=compositing.DEFAULT_BLOCK_ROWS)
-    parser.add_argument("--block-cols", type=int, default=compositing.DEFAULT_BLOCK_COLS)
+    parser.add_argument("--block-rows", type=int, default=DEFAULT_BLOCK_ROWS)
+    parser.add_argument("--block-cols", type=int, default=DEFAULT_BLOCK_COLS)
     parser.add_argument("--gdal-cache-mb", type=int, default=compositing.DEFAULT_GDAL_CACHE_MB,
-                         help="GDAL block cache size, in MB (default: %(default)s)")
+                         help="GDAL block cache size per process, in MB (default: %(default)s)")
     parser.add_argument("--min-observations", type=int, default=1,
                          help="(band, pixel) combinations seen by fewer than this many "
                               "selected scenes are left nodata for that band")
     parser.add_argument("--stats", nargs="+", default=compositing.ALL_STATS, choices=compositing.ALL_STATS)
     parser.add_argument("--years", nargs="+", type=int, default=None,
                          help="restrict to specific solstice year(s) (default: every year found)")
+    parser.add_argument("--workers", type=int, default=1,
+                         help="process this many solstice years in parallel (default: 1, sequential)")
     args = parser.parse_args()
 
     gdal.SetCacheMax(args.gdal_cache_mb * 1024 * 1024)
@@ -278,26 +340,31 @@ def main():
     years = sorted(by_year)
     if args.years is not None:
         years = [y for y in years if y in set(args.years)]
-    print(f"{len(years)} solstice year(s) to process.")
+    print(f"{len(years)} solstice year(s) to process with {args.workers} worker(s).")
 
     os.makedirs(args.output_dir, exist_ok=True)
-    for year in years:
-        selected = by_year[year]
-        n_4b = sum(1 for _s, tag in selected if tag == "4b")
-        n_8b = sum(1 for _s, tag in selected if tag == "8b")
-        print(f"[{year}] {len(selected)} scene(s) ({n_4b} 4-band, {n_8b} 8-band)")
+    jobs = [
+        (year, by_year[year], args.output_dir, args.prefix, args.stats,
+         args.block_rows, args.block_cols, args.gdal_cache_mb, args.min_observations)
+        for year in years
+    ]
 
-        resolved = compositing.resolve_scenes(selected, CANONICAL_BANDS, require_all_bands=False)
-        if not resolved:
-            print(f"  No usable scenes for {year}; skipping.")
-            continue
+    if args.workers <= 1:
+        for job in jobs:
+            _process_one_year_star(job)
+        return
 
-        output_path = os.path.join(args.output_dir, f"{args.prefix}_{year}.tif")
-        compositing.build_composite(
-            resolved, CANONICAL_BANDS, args.stats, output_path,
-            all_groups=["4b", "8b"],  # fixed band layout even in a year with only one product
-            block_rows=args.block_rows, block_cols=args.block_cols, min_observations=args.min_observations,
-        )
+    # "fork" (the Linux default) is used explicitly rather than relying on
+    # the platform default: discovery above only reads headers/paths (no
+    # open GDAL datasets to duplicate across the fork), and every job's
+    # arguments are plain picklable dataclasses/strings/ints either way, so
+    # this is safe and avoids re-importing/re-running module-level code the
+    # "spawn" start method would require -- see
+    # build_monthly_composites.py's identical choice.
+    ctx = multiprocessing.get_context("fork")
+    with ctx.Pool(processes=args.workers) as pool:
+        for label in pool.imap_unordered(_process_one_year_star, jobs):
+            print(f"=== finished year {label} ===", flush=True)
 
 
 if __name__ == "__main__":
