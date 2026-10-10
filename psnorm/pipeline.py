@@ -510,6 +510,9 @@ class PipelineConfig:
     shadow_angle_bucket_deg: float  # sun (azimuth, elevation) rounding granularity for the on-disk shadow-mask cache
     mask_erode_px: int  # search-mask morphology (see masking.erode_dilate_bitmask) -- 0 disables
     mask_dilate_px: int
+    force_registration: bool  # see registration.py -- is_grid_aligned alone misses PlanetScope's sub-pixel geolocation wobble
+    registration_warp_model: Literal["tps", "affine"]  # see registration.register_to_reference
+    registration_buffer_m: float  # reference search margin around each target's extent, see registration.register_to_reference
 
 
 @dataclass
@@ -860,10 +863,13 @@ def _detect_candidates_for_scene(scene: io.Scene, config: PipelineConfig) -> Can
     ref_info = io.get_raster_info(config.reference_analytic_path)
     tgt_info = io.get_raster_info(scene.analytic_path)
 
-    if not registration.is_grid_aligned(ref_info, tgt_info):
+    if config.force_registration or not registration.is_grid_aligned(ref_info, tgt_info):
         try:
-            aligned_path = registration.register_to_reference(scene.analytic_path, config.reference_analytic_path)
-        except NotImplementedError as exc:
+            aligned_path = registration.register_to_reference(
+                scene.analytic_path, config.reference_analytic_path,
+                warp_model=config.registration_warp_model, buffer_m=config.registration_buffer_m,
+            )
+        except (NotImplementedError, registration.RegistrationFailed) as exc:
             return CandidateOutcome(scene.scene_id, "skipped_registration", message=str(exc))
         target_analytic_path = aligned_path
         tgt_info = io.get_raster_info(aligned_path)
@@ -1265,6 +1271,9 @@ def run_pipeline(
     shadow_angle_bucket_deg: float = 1.0,
     mask_erode_px: int = 1,
     mask_dilate_px: int = 1,
+    force_registration: bool = False,  # attempt registration.register_to_reference even when is_grid_aligned is already True
+    registration_warp_model: Literal["tps", "affine"] = "tps",
+    registration_buffer_m: float = 500.0,
     scene_ids: set[str] | None = None,
     scenes: list[io.Scene] | None = None,
     log=print,
@@ -1371,6 +1380,9 @@ def run_pipeline(
         shadow_angle_bucket_deg=shadow_angle_bucket_deg,
         mask_erode_px=mask_erode_px,
         mask_dilate_px=mask_dilate_px,
+        force_registration=force_registration,
+        registration_warp_model=registration_warp_model,
+        registration_buffer_m=registration_buffer_m,
     )
     if dsm_path is not None:
         log(f"Preparing LiDAR masks from DSM '{dsm_path}' "

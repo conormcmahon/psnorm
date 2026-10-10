@@ -9,6 +9,10 @@ dependencies = [
     "numpy",
     "scipy",
     "GDAL",
+    "rioxarray",
+    # Not on PyPI -- a sibling local package (../../planet_georeg_opencv).
+    # Install with: pip install -e ../../planet_georeg_opencv
+    "planet_georeg_opencv",
 ]
 
 [project.optional-dependencies]
