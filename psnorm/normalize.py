@@ -365,6 +365,12 @@ def reclassify_invariant_pixels(
 DEFAULT_OUTLIER_ABS_THRESHOLD_DN = 200.0
 DEFAULT_SLOPE_BOUNDS = (1 / 1.5, 1.5)
 DEFAULT_RANSAC_MAX_ITERATIONS = 10_000
+# Candidates are scored on a random subset of at most this many points (all
+# points when there are fewer); the winner is then re-scored and polished on
+# every point. Scoring cost grows with the point count, and above ~100k
+# points the working arrays fall out of cache, so a 200k-point band took
+# ~17 s at 10,000 iterations against ~0.4 s for 20k.
+DEFAULT_RANSAC_SCORE_SUBSAMPLE = 20_000
 
 
 def _ransac_abs_inliers(
@@ -387,6 +393,7 @@ def _ransac_orthogonal_regression(
     sample_size: int = 12,
     seed: int = 0,
     slope_bounds: tuple[float, float] | None = None,
+    score_subsample: int | None = DEFAULT_RANSAC_SCORE_SUBSAMPLE,
 ) -> tuple[np.ndarray, np.ndarray, int, np.ndarray]:
     """RANSAC-selected inlier (x, y) subset for orthogonal regression.
 
@@ -399,6 +406,16 @@ def _ransac_orthogonal_regression(
     the best found (or, if none was plausible, on no trimming). The winning inlier set is then refit once and
     re-scored against that refined model (a standard RANSAC "polish" step),
     so the minimal-sample candidate doesn't itself become the final answer.
+
+    `score_subsample` (None or 0 to disable): with more points than this,
+    candidates are drawn from and scored against one fixed random subset of
+    that many points instead of all of them. Only the search uses the
+    subset; the winning candidate's inliers are then found among *all*
+    points, and the polish step refits and re-scores on all of them too, so
+    every point still ends up classified as inlier or outlier. With 20,000
+    points the subset's inlier fraction is within about ±0.3 percentage
+    points of the full set's, so ranking candidates on it picks essentially
+    the same winner.
 
     `slope_bounds`, if given, is enforced *during the search itself*: a
     sampled candidate whose own slope falls outside `slope_bounds` is
@@ -431,24 +448,29 @@ def _ransac_orthogonal_regression(
         return x, y, 0, np.ones(n, dtype=bool)
 
     rng = np.random.default_rng(seed)
-    best_mask: np.ndarray | None = None
+    if score_subsample and n > score_subsample:
+        score_idx = rng.choice(n, size=score_subsample, replace=False)
+        xs, ys = x[score_idx], y[score_idx]
+    else:
+        xs, ys = x, y
+    m = xs.size
+    best_model: tuple[float, float] | None = None
     best_count = -1
 
     for _ in range(max_iterations):
-        idx = rng.choice(n, size=sample_size, replace=False)
+        idx = rng.choice(m, size=sample_size, replace=False)
         try:
-            slope, intercept, _r2 = fit_orthogonal_regression(x[idx], y[idx])
+            slope, intercept, _r2 = fit_orthogonal_regression(xs[idx], ys[idx])
         except (ValueError, ZeroDivisionError):
             continue
         if not (np.isfinite(slope) and np.isfinite(intercept)):
             continue
         if slope_bounds is not None and not (slope_bounds[0] <= slope <= slope_bounds[1]):
             continue
-        inliers = _ransac_abs_inliers(x, y, slope, intercept, outlier_abs_threshold_dn)
-        count = int(inliers.sum())
+        count = int(_ransac_abs_inliers(xs, ys, slope, intercept, outlier_abs_threshold_dn).sum())
         if count > best_count:
             best_count = count
-            best_mask = inliers
+            best_model = (slope, intercept)
 
     # A winning candidate supported by fewer points than it took to define
     # it (< sample_size) isn't meaningfully "well-supported" -- 2 points
@@ -461,7 +483,10 @@ def _ransac_orthogonal_regression(
     # caller's own min_fit_pixels/slope_bounds post-hoc check (see
     # fit_regression_from_mask), same as the "no candidate ever plausible"
     # case already does.
-    if best_mask is None or best_count < sample_size:
+    if best_model is None or best_count < sample_size:
+        return x, y, 0, np.ones(n, dtype=bool)
+    best_mask = _ransac_abs_inliers(x, y, *best_model, outlier_abs_threshold_dn)
+    if best_mask.sum() < sample_size:
         return x, y, 0, np.ones(n, dtype=bool)
 
     # Polish: refit on the winning inlier set, then re-score everyone
@@ -500,6 +525,7 @@ def fit_regression_from_mask(
     outlier_abs_threshold_dn: float | None = DEFAULT_OUTLIER_ABS_THRESHOLD_DN,
     slope_bounds: tuple[float, float] | None = DEFAULT_SLOPE_BOUNDS,
     ransac_max_iterations: int = DEFAULT_RANSAC_MAX_ITERATIONS,
+    ransac_score_subsample: int | None = DEFAULT_RANSAC_SCORE_SUBSAMPLE,
     min_fit_pixels: int = 500,
     return_inlier_masks: bool = False,
 ) -> NormalizationModel | tuple[NormalizationModel, dict[str, np.ndarray]]:
@@ -517,7 +543,8 @@ def fit_regression_from_mask(
     `outlier_abs_threshold_dn` (default 200 DN, i.e. 0.02 surface
     reflectance; pass None to disable) drives a RANSAC pass per band (see
     _ransac_orthogonal_regression), of `ransac_max_iterations` candidate
-    fits: still an orthogonal-regression fit (neither image is ground
+    fits, each scored on a random subset of at most `ransac_score_subsample`
+    points (the winner is then applied to, and polished on, every point): still an orthogonal-regression fit (neither image is ground
     truth — both carry error, so a total-least-squares model form is kept
     rather than switching to OLS), with a point an inlier when the
     observed reference value is within that many DN of the model's
@@ -635,6 +662,7 @@ def fit_regression_from_mask(
         if outlier_abs_threshold_dn is not None:
             x, y, n_outliers, inlier_mask = _ransac_orthogonal_regression(
                 x, y, outlier_abs_threshold_dn, slope_bounds=slope_bounds, max_iterations=ransac_max_iterations,
+                score_subsample=ransac_score_subsample,
             )
 
         # before/after both computed over the same final (post-trim) point

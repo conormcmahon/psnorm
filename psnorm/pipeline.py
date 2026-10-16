@@ -498,6 +498,7 @@ class PipelineConfig:
     use_log_transform: bool
     slope_bounds: tuple[float, float] | None
     ransac_max_iterations: int
+    ransac_score_subsample: int | None
     min_fit_pixels: int
     device: str  # already-resolved "cpu"/"gpu" (see backend.resolve_device) -- Phase A's IR-MAD fit + classify only
     dsm_path: str | None  # None (default) disables every LiDAR-derived mask below entirely
@@ -805,6 +806,7 @@ def _fit_settings(config: PipelineConfig) -> dict:
         "outlier_abs_threshold_dn": config.outlier_abs_threshold_dn,
         "slope_bounds": list(config.slope_bounds) if config.slope_bounds is not None else None,
         "ransac_max_iterations": config.ransac_max_iterations,
+        "ransac_score_subsample": config.ransac_score_subsample,
         "min_fit_pixels": config.min_fit_pixels,
         "per_scene_clear_mask": True,
     }
@@ -1055,6 +1057,7 @@ def _finalize_target_scene(scene: io.Scene, outcome: CandidateOutcome, config: P
             downsample_factor=config.target_downsample_factor,
             outlier_abs_threshold_dn=config.outlier_abs_threshold_dn,
             slope_bounds=config.slope_bounds, ransac_max_iterations=config.ransac_max_iterations,
+            ransac_score_subsample=config.ransac_score_subsample,
             min_fit_pixels=config.min_fit_pixels,
             return_inlier_masks=True,
         )
@@ -1283,6 +1286,7 @@ def run_pipeline(
     use_log_transform: bool = True,
     slope_bounds: tuple[float, float] | None = normalize.DEFAULT_SLOPE_BOUNDS,
     ransac_max_iterations: int = normalize.DEFAULT_RANSAC_MAX_ITERATIONS,
+    ransac_score_subsample: int | None = normalize.DEFAULT_RANSAC_SCORE_SUBSAMPLE,
     min_fit_pixels: int = 500,
     device: Literal["auto", "cpu", "gpu"] = "auto",
     dsm_path: str | None = None,
@@ -1405,6 +1409,7 @@ def run_pipeline(
         use_log_transform=use_log_transform,
         slope_bounds=slope_bounds,
         ransac_max_iterations=ransac_max_iterations,
+        ransac_score_subsample=ransac_score_subsample,
         min_fit_pixels=min_fit_pixels,
         device=resolved_device,
         dsm_path=dsm_path,

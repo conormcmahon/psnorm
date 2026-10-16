@@ -178,7 +178,12 @@ for dark and bright targets. (An earlier version used a 5% tolerance
 relative to the prediction, which was very tight for dark targets — about
 ±25 DN at 500 — and loose for bright ones.) RANSAC tries
 `ransac_max_iterations` (default 10,000) candidate fits before settling on
-the best one found, or on no trimming if none was plausible. Excluded
+the best one found, or on no trimming if none was plausible. When a band
+has more than `ransac_score_subsample` (default 20,000) consensus points,
+candidates are scored on one fixed random subset of that size, and the
+winner is then applied to and polished on every point; this keeps a
+200,000-point band at well under a second rather than ~17 s. Pass
+`ransac_score_subsample=None` to score on every point. Excluded
 points are dropped entirely (weight 0), not down-weighted, since
 contamination sources like cloud/haze/shadow leak-through tend to bias
 residuals in one direction — a soft (IRLS/Huber-style) weighting would
@@ -447,6 +452,7 @@ result = run_pipeline(
     downsample_resolution_m=15.0,  # only used when downsample_targets=True
     outlier_abs_threshold_dn=200.0,  # RANSAC inlier tolerance in DN (0.02 reflectance); None disables
     ransac_max_iterations=10_000,    # RANSAC candidate fits tried before settling on the best
+    ransac_score_subsample=20_000,   # score candidates on at most this many points; None = all
     slope_bounds=(1 / 1.5, 1.5),  # reject (fall back to identity) fits outside this slope range; None disables
     min_fit_pixels=500,        # reject (fall back to identity) fits from fewer post-RANSAC points than this
     workers="cpu",

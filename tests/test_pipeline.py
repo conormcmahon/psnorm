@@ -512,7 +512,9 @@ def test_saved_model_with_different_ransac_settings_is_refit(tmp_path):
                   invariance_frequency_threshold=0.1, min_observations=1, device="cpu", workers=None)
     pipeline.run_pipeline(str(input_dir), str(output_dir), **kwargs)
     model_path = pipeline._model_path(str(output_dir), "20240102_120000_tgt")
-    assert model_io.load_model(model_path).fit_settings["outlier_abs_threshold_dn"] == 200.0
+    settings = model_io.load_model(model_path).fit_settings
+    assert settings["outlier_abs_threshold_dn"] == 200.0
+    assert settings["ransac_score_subsample"] == 20_000
 
     same = pipeline.run_pipeline(str(input_dir), str(output_dir), resume="validate", **kwargs)
     assert {r.scene_id: r.status for r in same.scene_results}["20240102_120000_tgt"] == "resumed"

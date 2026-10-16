@@ -72,6 +72,42 @@ def test_ransac_defaults():
     assert normalize.DEFAULT_OUTLIER_ABS_THRESHOLD_DN == 200.0
     assert normalize.DEFAULT_SLOPE_BOUNDS == pytest.approx((1 / 1.5, 1.5))
     assert normalize.DEFAULT_RANSAC_MAX_ITERATIONS == 10_000
+    assert normalize.DEFAULT_RANSAC_SCORE_SUBSAMPLE == 20_000
+
+
+def test_ransac_subsampled_scoring_still_classifies_every_point():
+    rng = np.random.default_rng(3)
+    n = 60_000
+    x = rng.uniform(200, 4000, n)
+    y = 30.0 + 1.05 * x + rng.normal(0, 40.0, n)
+    bad = rng.random(n) < 0.25
+    y[bad] += rng.choice([-1, 1], bad.sum()) * rng.uniform(400, 2000, bad.sum())
+
+    _, _, n_sub, mask_sub = normalize._ransac_orthogonal_regression(
+        x, y, 200.0, max_iterations=500, slope_bounds=normalize.DEFAULT_SLOPE_BOUNDS, score_subsample=5_000)
+    _, _, n_all, mask_all = normalize._ransac_orthogonal_regression(
+        x, y, 200.0, max_iterations=500, slope_bounds=normalize.DEFAULT_SLOPE_BOUNDS, score_subsample=None)
+
+    # Outliers among the points outside the scoring subset are still removed.
+    assert mask_sub.shape == (n,)
+    assert not mask_sub[bad].any()
+    assert mask_sub[~bad].mean() > 0.99
+    # Same answer as scoring on every point, to within a handful of
+    # borderline points.
+    assert abs(n_sub - n_all) < 0.001 * n
+    slope, intercept, _ = fit_orthogonal_regression(x[mask_sub], y[mask_sub])
+    assert slope == pytest.approx(1.05, abs=0.005)
+    assert intercept == pytest.approx(30.0, abs=15.0)
+
+
+def test_ransac_score_subsample_has_no_effect_below_its_size():
+    rng = np.random.default_rng(4)
+    x = rng.uniform(200, 4000, 3_000)
+    y = 30.0 + 1.05 * x + rng.normal(0, 40.0, x.size)
+    y[:300] += 900.0
+    a = normalize._ransac_orthogonal_regression(x, y, 200.0, max_iterations=200, score_subsample=5_000)
+    b = normalize._ransac_orthogonal_regression(x, y, 200.0, max_iterations=200, score_subsample=None)
+    np.testing.assert_array_equal(a[3], b[3])
 
 
 def test_ransac_orthogonal_regression_removes_absolute_outliers_at_the_default_threshold():
