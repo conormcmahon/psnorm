@@ -15,6 +15,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from psnorm import registration
 from psnorm.pipeline import run_pipeline
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -58,6 +59,10 @@ def main():
                          help="sun (azimuth, elevation) rounding granularity for the on-disk shadow-mask cache")
     parser.add_argument("--mask-erode-px", type=int, default=1)
     parser.add_argument("--mask-dilate-px", type=int, default=1)
+    parser.add_argument("--force-registration", action="store_true",
+                         help="register every target to the reference even when their grids already line up "
+                              "(see psnorm.registration)")
+    registration.add_registration_arguments(parser)
     args = parser.parse_args()
 
     workers = args.workers
@@ -91,6 +96,8 @@ def main():
         shadow_angle_bucket_deg=args.shadow_angle_bucket_deg,
         mask_erode_px=args.mask_erode_px,
         mask_dilate_px=args.mask_dilate_px,
+        force_registration=args.force_registration,
+        registration_params=registration.registration_params_from_args(args),
     )
     elapsed = time.time() - start
 

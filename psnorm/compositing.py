@@ -47,6 +47,7 @@ Key design points:
 from __future__ import annotations
 
 import glob
+import math
 import os
 import time
 from dataclasses import dataclass, replace
@@ -280,11 +281,43 @@ def fast_nan_rank_stat(sorted_stack: np.ndarray, counts: np.ndarray, q: float) -
     return lower_vals + (upper_vals - lower_vals) * frac
 
 
-def create_output(path: str, out_info: io.RasterInfo, out_band_names: list[str]) -> "gdal.Dataset":
+def output_tile_size(block_rows: int, block_cols: int) -> int:
+    """GeoTIFF internal tile size (square) that evenly divides the
+    build_composite write blocks, so every internal tile is written
+    exactly once.
+
+    This matters: a compressed GeoTIFF block that is written again (e.g.
+    a full-width strip touched once per column-block of the write loop)
+    can't be overwritten in place, so GDAL appends the new copy and
+    orphans the old one. Composites built with GDAL's default one-row
+    strips and 1024-column write blocks ended up ~83% dead space.
+    """
+    tile = math.gcd(block_rows, block_cols, 512)
+    if tile % 16:
+        raise ValueError(
+            f"block_rows={block_rows} and block_cols={block_cols} share no tile size that is a multiple of 16 "
+            f"(GeoTIFF's requirement); use multiples of 256, e.g. block_rows=256, block_cols=1024."
+        )
+    return tile
+
+
+def composite_creation_options(tile_size: int) -> list[str]:
+    """GTiff creation options for composites (and for rewriting existing
+    ones in place: see scripts/rewrite_composites.py). Tiled and
+    band-interleaved, so reading a few bands of a small window touches
+    only those bands' tiles; PREDICTOR=3 (floating-point) is lossless and
+    makes LZW much more effective on float32."""
+    return [
+        "TILED=YES", f"BLOCKXSIZE={tile_size}", f"BLOCKYSIZE={tile_size}", "INTERLEAVE=BAND",
+        "COMPRESS=LZW", "PREDICTOR=3", "BIGTIFF=IF_SAFER", "NUM_THREADS=ALL_CPUS",
+    ]
+
+
+def create_output(path: str, out_info: io.RasterInfo, out_band_names: list[str], tile_size: int) -> "gdal.Dataset":
     driver = gdal.GetDriverByName("GTiff")
     ds = driver.Create(
         path, out_info.width, out_info.height, len(out_band_names), gdal.GDT_Float32,
-        options=["COMPRESS=LZW", "BIGTIFF=IF_SAFER", "NUM_THREADS=ALL_CPUS"],
+        options=composite_creation_options(tile_size),
     )
     ds.SetGeoTransform(out_info.geotransform)
     ds.SetProjection(out_info.crs)
@@ -362,7 +395,7 @@ def build_composite(
         f"{len(resolved_scenes)} scene(s)" + ("" if single_group else f", groups={groups}"))
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    ds = create_output(output_path, out_info, out_band_names)
+    ds = create_output(output_path, out_info, out_band_names, output_tile_size(block_rows, block_cols))
 
     opened_scenes = open_scenes(resolved_scenes, log=log)
     if not opened_scenes:
@@ -428,8 +461,9 @@ def build_composite(
                 # rows, cols) buffer and written in a single
                 # DatasetWriteArray call below, rather than one
                 # WriteArray-per-band call -- writing band-by-band to a
-                # PIXEL-interleaved GeoTIFF (GDAL's default, used here)
-                # makes GDAL read back and rewrite the whole interleaved
+                # PIXEL-interleaved GeoTIFF (GDAL's default; composites
+                # are BAND-interleaved now, see composite_creation_options,
+                # but the single write is kept) makes GDAL read back and rewrite the whole interleaved
                 # block on every single-band write, since the block isn't
                 # complete until every band has been written; that cost
                 # compounds with band count (measured ~3s/tile at 22

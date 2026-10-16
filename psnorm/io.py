@@ -26,6 +26,15 @@ gdal.UseExceptions()
 DEFAULT_BLOCK_ROWS = 512
 
 
+def gdal_thread_count() -> str:
+    """Value for GDAL's NUM_THREADS option (tile compression/decompression
+    threads): the GDAL_NUM_THREADS environment variable if set, else
+    "ALL_CPUS". Processes that run several to a machine should set it to
+    their share of the cores -- each asking for all of them makes them
+    slower, not faster."""
+    return os.environ.get("GDAL_NUM_THREADS") or "ALL_CPUS"
+
+
 @dataclass(frozen=True)
 class RasterInfo:
     path: str

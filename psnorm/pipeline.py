@@ -511,8 +511,7 @@ class PipelineConfig:
     mask_erode_px: int  # search-mask morphology (see masking.erode_dilate_bitmask) -- 0 disables
     mask_dilate_px: int
     force_registration: bool  # see registration.py -- is_grid_aligned alone misses PlanetScope's sub-pixel geolocation wobble
-    registration_warp_model: Literal["tps", "affine"]  # see registration.register_to_reference
-    registration_buffer_m: float  # reference search margin around each target's extent, see registration.register_to_reference
+    registration_params: registration.RegistrationParams  # every registration setting; see that class
 
 
 @dataclass
@@ -867,7 +866,7 @@ def _detect_candidates_for_scene(scene: io.Scene, config: PipelineConfig) -> Can
         try:
             aligned_path = registration.register_to_reference(
                 scene.analytic_path, config.reference_analytic_path,
-                warp_model=config.registration_warp_model, buffer_m=config.registration_buffer_m,
+                params=config.registration_params, target_udm2_path=scene.udm2_path,
             )
         except (NotImplementedError, registration.RegistrationFailed) as exc:
             return CandidateOutcome(scene.scene_id, "skipped_registration", message=str(exc))
@@ -1272,8 +1271,7 @@ def run_pipeline(
     mask_erode_px: int = 1,
     mask_dilate_px: int = 1,
     force_registration: bool = False,  # attempt registration.register_to_reference even when is_grid_aligned is already True
-    registration_warp_model: Literal["tps", "affine"] = "tps",
-    registration_buffer_m: float = 500.0,
+    registration_params: registration.RegistrationParams | None = None,  # None == RegistrationParams() defaults
     scene_ids: set[str] | None = None,
     scenes: list[io.Scene] | None = None,
     log=print,
@@ -1381,8 +1379,7 @@ def run_pipeline(
         mask_erode_px=mask_erode_px,
         mask_dilate_px=mask_dilate_px,
         force_registration=force_registration,
-        registration_warp_model=registration_warp_model,
-        registration_buffer_m=registration_buffer_m,
+        registration_params=registration_params or registration.RegistrationParams(),
     )
     if dsm_path is not None:
         log(f"Preparing LiDAR masks from DSM '{dsm_path}' "

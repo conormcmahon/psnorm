@@ -24,7 +24,7 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from psnorm import io as pio
-from psnorm import pipeline
+from psnorm import pipeline, registration
 
 MAX_ATTEMPTS = 150
 RETRY_DELAY_S = 20.0
@@ -52,6 +52,8 @@ def _run_pipeline_kwargs(args):
         shadow_ray_step_m=args.shadow_ray_step_m,
         mask_erode_px=args.mask_erode_px,
         mask_dilate_px=args.mask_dilate_px,
+        force_registration=args.force_registration,
+        registration_params=registration.registration_params_from_args(args),
     )
 
 
@@ -122,6 +124,10 @@ def main():
     parser.add_argument("--mask-erode-px", type=int, default=1)
     parser.add_argument("--mask-dilate-px", type=int, default=1)
     parser.add_argument("--max-references", type=int, default=30)
+    parser.add_argument("--force-registration", action="store_true",
+                         help="register every target to the reference even when their grids already line up "
+                              "(see psnorm.registration)")
+    registration.add_registration_arguments(parser)
     args = parser.parse_args()
 
     workers = args.workers
