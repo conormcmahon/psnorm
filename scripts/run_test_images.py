@@ -62,6 +62,9 @@ def main():
     parser.add_argument("--force-registration", action="store_true",
                          help="register every target to the reference even when their grids already line up "
                               "(see psnorm.registration)")
+    parser.add_argument("--recursive", action="store_true",
+                         help="also find scenes in --input's subfolders, e.g. a raw archive laid out as "
+                              "<product>/<period>/ (4- and 8-band scenes are both found either way)")
     parser.add_argument("--preferred-imagery-manifest", default=None,
                          help="preferred_imagery.csv from a registration run (see psnorm.preferred_imagery): scenes whose "
                               "registration was accepted are read from their registered file instead of the raw one "
@@ -103,6 +106,7 @@ def main():
         force_registration=args.force_registration,
         registration_params=registration.registration_params_from_args(args),
         preferred_imagery_manifest=args.preferred_imagery_manifest,
+        recursive=args.recursive,
     )
     elapsed = time.time() - start
 

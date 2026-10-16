@@ -11,7 +11,7 @@ Usage:
         [--dsm-path PATH] [--dsm-height-units m|ft] [--max-slope-deg F] \\
         [--roughness-window-radius-px N] [--roughness-max-deg F] \\
         [--use-shadow-mask] [--max-building-height-m F] [--shadow-ray-step-m F] \\
-        [--mask-erode-px N] [--mask-dilate-px N] [--preferred-imagery-manifest CSV]
+        [--mask-erode-px N] [--mask-dilate-px N] [--preferred-imagery-manifest CSV] [--recursive]
 """
 
 import argparse
@@ -128,6 +128,9 @@ def main():
     parser.add_argument("--force-registration", action="store_true",
                          help="register every target to the reference even when their grids already line up "
                               "(see psnorm.registration)")
+    parser.add_argument("--recursive", action="store_true",
+                         help="also find scenes in --input's subfolders, e.g. a raw archive laid out as "
+                              "<product>/<period>/ (4- and 8-band scenes are both found either way)")
     parser.add_argument("--preferred-imagery-manifest", default=None,
                          help="preferred_imagery.csv from a registration run (see psnorm.preferred_imagery): scenes whose "
                               "registration was accepted are read from their registered file instead of the raw one "
@@ -141,13 +144,15 @@ def main():
     else:
         workers = int(workers)
 
+    if args.scene_log and args.recursive:
+        parser.error("--scene-log looks scenes up in --input itself only; it cannot be combined with --recursive")
     if args.scene_log:
         scene_ids = pio.scene_ids_from_log(args.scene_log)
         log(f"Read {len(scene_ids)} candidate scene IDs from '{args.scene_log}'.")
         scenes = pio.discover_scenes_from_ids(args.input, scene_ids, log=log)
         log(f"Discovered {len(scenes)} scenes total.")
     else:
-        scenes = pio.discover_scenes(args.input)
+        scenes = pio.discover_scenes(args.input, recursive=args.recursive)
         log(f"Discovered {len(scenes)} scenes total.")
     if not scenes:
         raise ValueError(f"No scenes found for input '{args.input}'.")

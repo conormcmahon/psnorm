@@ -82,12 +82,16 @@ alongside the final gain/offset.
 3. **Phase C — final fit + apply.** Each target's gain/offset is re-fit
    (per-band orthogonal regression) using *only* the consensus set, then
    applied to the *entire* target scene — masked/excluded pixels included.
-   Masking only ever gates which pixels are searched for invariant targets;
-   it never gates what gets corrected in the output. Before the final fit,
-   a RANSAC pass (`outlier_relative_threshold`, default 0.05 — see
-   "Outlier handling" below) excludes consensus pixels the winning model
-   can't explain within a relative tolerance, so a handful of contaminated
-   points (e.g. cloud/haze leak-through) can't skew an otherwise-good band.
+   Masking only ever gates which pixels are searched for invariant targets
+   and fitted on; it never gates what gets corrected in the output. The fit
+   uses only consensus pixels that are also clear (not cloud, shadow, haze,
+   nodata, water or vegetation) in *this* target's own search mask and the
+   reference's: the consensus set is study-wide, so without this a pixel
+   invariant in most scenes would still be fitted where this scene is
+   cloudy. Before the final fit, a RANSAC pass (`outlier_abs_threshold_dn`,
+   default 200 DN — see "Outlier handling" below) excludes consensus
+   pixels the winning model can't explain within that absolute tolerance,
+   so a handful of contaminated points can't skew an otherwise-good band.
    The resulting fit is then sanity-checked (`slope_bounds`,
    `min_fit_pixels` — see "Plausibility guard" below) and rejected in favor
    of the identity transform if it's implausible or poorly supported.
@@ -125,7 +129,7 @@ consensus pixels far off the true relationship for that scene.
 regression`), not a single fit-then-clip pass: repeatedly fit a candidate
 orthogonal-regression line from a small random subset of the consensus
 points, score each candidate by how many of *all* the points it explains
-within `outlier_relative_threshold`, and keep whichever candidate has the
+within `outlier_abs_threshold_dn`, and keep whichever candidate has the
 most support; the winning inlier set is then refit and re-scored once more
 (a standard RANSAC "polish" step) before the caller's own final fit. The
 model form stays orthogonal regression throughout — neither the reference
@@ -166,19 +170,20 @@ all"). Cross-reference against `identity_fallback`/`fallback_reason` in the
 corresponding `models/{scene_id}_model.json` to see whether that inlier set
 was actually applied.
 
-The outlier criterion is **relative to the model's own prediction**, not a
-fixed DN difference: a point is an outlier if `|observed - predicted| /
-|predicted| > outlier_relative_threshold` (predicted = intercept +
-slope×target; the denominator is floored at 1 DN so a near-zero prediction
-can't blow up the ratio). A fixed *absolute* DN threshold would itself
-reproduce the dark/bright imbalance this whole feature is meant to guard
-against — a 50 DN deviation is huge for a dark road and trivial for a
-bright roof; a percentage threshold is equally strict for both. Excluded
+The outlier criterion is an **absolute** difference: a point is an
+outlier if `|observed - predicted| > outlier_abs_threshold_dn` (predicted
+= intercept + slope×target, in reference DN). The default, 200 DN, is 0.02
+surface reflectance at PlanetScope's ×10000 scaling, the same tolerance
+for dark and bright targets. (An earlier version used a 5% tolerance
+relative to the prediction, which was very tight for dark targets — about
+±25 DN at 500 — and loose for bright ones.) RANSAC tries
+`ransac_max_iterations` (default 10,000) candidate fits before settling on
+the best one found, or on no trimming if none was plausible. Excluded
 points are dropped entirely (weight 0), not down-weighted, since
 contamination sources like cloud/haze/shadow leak-through tend to bias
 residuals in one direction — a soft (IRLS/Huber-style) weighting would
 still let that directional bias pull the fit. Pass
-`outlier_relative_threshold=None` to disable this and use every consensus
+`outlier_abs_threshold_dn=None` to disable this and use every consensus
 pixel as-is.
 
 ## Plausibility guard: rejecting implausible fits
@@ -190,14 +195,14 @@ from a coincidentally-tight small subset (empirically, this project's own
 test dataset shows a sharp quality split around ~5000 consensus pixels: at
 or above it, fits are consistently sane; well below it, a meaningful
 fraction land on wildly-scaled or even negative slopes, regardless of
-`outlier_relative_threshold`). PlanetScope radiometric drift is expected to
+`outlier_abs_threshold_dn`). PlanetScope radiometric drift is expected to
 be *subtle* — after RANSAC, each band's fit is checked against that prior,
 and rejected (not down-weighted, not partially applied) if it fails:
 
 - **Too little support**: fewer than `min_fit_pixels` (default 500) points
   survived RANSAC for this band.
 - **Implausible slope**: the fitted slope falls outside `slope_bounds`
-  (default `(0.8, 1.2)`; pass `None` to disable this check).
+  (default `(1/1.5, 1.5)`, about 0.667–1.5; pass `None` to disable this check).
 
 A rejected band falls back to the **identity transform** (`slope=1.0,
 intercept=0.0`) — i.e. that band is left uncorrected in the output rather
@@ -210,7 +215,7 @@ the same scene falls back, if only that band's fit is untrustworthy.
 | field | meaning |
 |---|---|
 | `identity_fallback` | `True` if this band's slope/intercept were replaced with the identity transform |
-| `fallback_reason` | why, e.g. `"only 350 consensus pixels survived RANSAC (< min_fit_pixels=500)"` or `"slope 0.427 outside plausible bounds (0.8, 1.2)"` — `None` if no fallback |
+| `fallback_reason` | why, e.g. `"only 350 consensus pixels survived RANSAC (< min_fit_pixels=500)"` or `"slope 0.427 outside plausible bounds (0.667, 1.5)"` — `None` if no fallback |
 | `raw_slope`, `raw_intercept` | the rejected RANSAC fit, kept for inspection — `None` when there was no fallback (in which case they'd just duplicate `slope`/`intercept`) |
 
 Every `BandModel` in a saved `models/{scene_id}_model.json` reports, over
@@ -440,16 +445,20 @@ result = run_pipeline(
     min_observations=2,                   # floor so 1-2 lucky observations can't qualify
     downsample_targets=False,      # True to search for targets/fit corrections at reduced resolution
     downsample_resolution_m=15.0,  # only used when downsample_targets=True
-    outlier_relative_threshold=0.05,  # RANSAC pass, relative-to-prediction threshold; None disables
-    slope_bounds=(0.8, 1.2),   # reject (fall back to identity) fits outside this slope range; None disables
+    outlier_abs_threshold_dn=200.0,  # RANSAC inlier tolerance in DN (0.02 reflectance); None disables
+    ransac_max_iterations=10_000,    # RANSAC candidate fits tried before settling on the best
+    slope_bounds=(1 / 1.5, 1.5),  # reject (fall back to identity) fits outside this slope range; None disables
     min_fit_pixels=500,        # reject (fall back to identity) fits from fewer post-RANSAC points than this
     workers="cpu",
     device="auto",   # "auto"/"cpu"/"gpu" -- see "GPU support" below
 )
 ```
 
-This discovers `*_AnalyticMS_SR_harmonized_clip.tif` scenes (paired with
-their `*_udm2_clip.tif` and `*_metadata.json`), auto-selects a reference
+This discovers 4-band `*_AnalyticMS_SR_harmonized_clip.tif` and 8-band
+`*_AnalyticMS_SR_8b_harmonized_clip.tif` scenes (paired with their
+`*_udm2_clip.tif` and `*_metadata.json`; pass `recursive=True` to search
+subfolders too, e.g. a raw archive laid out as `<product>/<period>/`),
+auto-selects a reference
 scene (lowest 10th percentile of sun zenith angle, then highest clear
 fraction — pass `reference_path=...` to override), runs the three-phase
 invariant-target selection above, fits+applies a normalization model per

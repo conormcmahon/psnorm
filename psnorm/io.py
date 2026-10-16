@@ -110,31 +110,57 @@ def parse_acquisition_time(scene_id: str) -> datetime | None:
         return None
 
 
+# PlanetScope surface-reflectance analytic clips: 4-band (PSScene4Band /
+# harmonized 4-band) and 8-band (SuperDove) products.
+FOUR_BAND_SUFFIX = "_3B_AnalyticMS_SR_harmonized_clip.tif"
+EIGHT_BAND_SUFFIX = "_3B_AnalyticMS_SR_8b_harmonized_clip.tif"
+ANALYTIC_SUFFIXES = (FOUR_BAND_SUFFIX, EIGHT_BAND_SUFFIX)
+
+
+def _as_suffixes(analytic_suffix: str | tuple[str, ...]) -> tuple[str, ...]:
+    return (analytic_suffix,) if isinstance(analytic_suffix, str) else tuple(analytic_suffix)
+
+
 def discover_scenes(
     folder: str,
     *,
-    analytic_suffix: str = "_3B_AnalyticMS_SR_harmonized_clip.tif",
+    analytic_suffix: str | tuple[str, ...] = ANALYTIC_SUFFIXES,
     udm2_suffix: str = "_3B_udm2_clip.tif",
     metadata_suffix: str = "_metadata.json",
+    recursive: bool = False,
 ) -> list[Scene]:
     """Find analytic scenes in `folder` and pair each with its UDM2 mask and
-    metadata.json sidecar (present if found, `None` otherwise).
+    metadata.json sidecar (present if found, `None` otherwise), both looked
+    for next to the analytic file.
+
+    `analytic_suffix` is one file-name suffix or several; by default both
+    the 4-band and the 8-band products. `recursive` also searches every
+    subfolder (e.g. this project's raw archive, with one folder per product
+    and one subfolder per period under it). Scenes come back ordered by
+    scene ID (i.e. acquisition time). A scene ID found more than once
+    (e.g. the same scene under two products) raises ValueError, since every
+    per-scene output is named by scene ID.
 
     Skips macOS AppleDouble resource-fork files (`._*`), which are not valid
     rasters but otherwise match the same glob pattern.
     """
-    pattern = os.path.join(folder, f"*{analytic_suffix}")
-    analytic_paths = sorted(
-        p
-        for p in glob.glob(pattern)
-        if not os.path.basename(p).startswith("._")
-    )
+    found = []  # (scene_id, analytic_path)
+    for suffix in _as_suffixes(analytic_suffix):
+        pattern = os.path.join(folder, "**", f"*{suffix}") if recursive else os.path.join(folder, f"*{suffix}")
+        for p in glob.glob(pattern, recursive=recursive):
+            base = os.path.basename(p)
+            if not base.startswith("._"):
+                found.append((base[: -len(suffix)], p))
+    found.sort()
+    seen: dict[str, str] = {}
+    for scene_id, path in found:
+        if scene_id in seen:
+            raise ValueError(f"scene '{scene_id}' found twice: '{seen[scene_id]}' and '{path}'")
+        seen[scene_id] = path
 
     scenes = []
-    for analytic_path in analytic_paths:
+    for scene_id, analytic_path in found:
         folder_dir = os.path.dirname(analytic_path)
-        base = os.path.basename(analytic_path)
-        scene_id = base[: -len(analytic_suffix)]
 
         udm2_path = os.path.join(folder_dir, scene_id + udm2_suffix)
         metadata_path = os.path.join(folder_dir, scene_id + metadata_suffix)
@@ -179,7 +205,7 @@ def discover_scenes_from_ids(
     folder: str,
     scene_ids: set[str],
     *,
-    analytic_suffix: str = "_3B_AnalyticMS_SR_harmonized_clip.tif",
+    analytic_suffix: str | tuple[str, ...] = ANALYTIC_SUFFIXES,
     udm2_suffix: str = "_3B_udm2_clip.tif",
     metadata_suffix: str = "_metadata.json",
     log=lambda msg: None,
@@ -193,13 +219,16 @@ def discover_scenes_from_ids(
     `scene_ids_from_log`'s docstring). Candidates whose analytic file
     doesn't actually exist are skipped with a log line rather than raising,
     since the candidate list is inherently just "what a prior source
-    believed existed," not a guarantee.
+    believed existed," not a guarantee. With several `analytic_suffix`es
+    (by default the 4- and 8-band products), the first that exists is used.
     """
     scenes = []
     missing = 0
     for scene_id in sorted(scene_ids):
-        analytic_path = os.path.join(folder, scene_id + analytic_suffix)
-        if not os.path.exists(analytic_path):
+        analytic_path = next(
+            (path for path in (os.path.join(folder, scene_id + suffix) for suffix in _as_suffixes(analytic_suffix))
+             if os.path.exists(path)), None)
+        if analytic_path is None:
             missing += 1
             continue
         udm2_path = os.path.join(folder, scene_id + udm2_suffix)

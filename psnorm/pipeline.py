@@ -494,9 +494,10 @@ class PipelineConfig:
     resume: Literal["no", "yes", "validate"]
     block_rows: int
     target_downsample_factor: int  # 1 == disabled; see downsample_targets/downsample_resolution_m
-    outlier_relative_threshold: float | None
+    outlier_abs_threshold_dn: float | None
     use_log_transform: bool
     slope_bounds: tuple[float, float] | None
+    ransac_max_iterations: int
     min_fit_pixels: int
     device: str  # already-resolved "cpu"/"gpu" (see backend.resolve_device) -- Phase A's IR-MAD fit + classify only
     dsm_path: str | None  # None (default) disables every LiDAR-derived mask below entirely
@@ -795,6 +796,20 @@ def _existing_outputs_reusable(paths: list[str], resume: str) -> bool:
     return all(model_io.model_is_valid(p) if p.endswith(".json") else True for p in paths)
 
 
+def _fit_settings(config: PipelineConfig) -> dict:
+    """The Phase C settings a saved target model must match to be reused
+    (as JSON would store them). per_scene_clear_mask: fit points are
+    limited to pixels clear in that target's own search mask (models saved
+    before that change lack the key and are refit)."""
+    return {
+        "outlier_abs_threshold_dn": config.outlier_abs_threshold_dn,
+        "slope_bounds": list(config.slope_bounds) if config.slope_bounds is not None else None,
+        "ransac_max_iterations": config.ransac_max_iterations,
+        "min_fit_pixels": config.min_fit_pixels,
+        "per_scene_clear_mask": True,
+    }
+
+
 def _target_model_reusable(model_path: str, normalized_path: str, config: PipelineConfig) -> bool:
     """Like _existing_outputs_reusable, but additionally invalidated when
     the saved model was fit under a *different* invariance_frequency_
@@ -803,7 +818,8 @@ def _target_model_reusable(model_path: str, normalized_path: str, config: Pipeli
     normalize.NormalizationModel), and Phase B always recomputes the
     consensus mask fresh every run (no resume check of its own), so a saved
     model from a differently-thresholded consensus set is stale even though
-    the files themselves still exist and parse. Only meaningful for target
+    the files themselves still exist and parse. Likewise when its RANSAC
+    fit settings (_fit_settings) differ from the current ones. Only meaningful for target
     scenes -- the reference's own model is always the fixed identity
     transform regardless of these thresholds."""
     if not _existing_outputs_reusable([model_path, normalized_path], config.resume):
@@ -815,6 +831,7 @@ def _target_model_reusable(model_path: str, normalized_path: str, config: Pipeli
     return (
         model.invariance_frequency_threshold == config.invariance_frequency_threshold
         and model.min_observations == config.min_observations
+        and model.fit_settings == _fit_settings(config)
     )
 
 
@@ -1019,6 +1036,13 @@ def _finalize_target_scene(scene: io.Scene, outcome: CandidateOutcome, config: P
 
     consensus_mask_path = os.path.join(config.output_dir, "consensus", "consensus_mask.tif")
     consensus_window = masking.load_flags_window(consensus_mask_path, outcome.ref_window) != 0
+    # The consensus set is study-wide: a pixel invariant in most pairs is in
+    # it even where THIS target is cloudy, shadowed, hazy or nodata. Fit
+    # only on consensus pixels that are clear in this target's (and the
+    # reference's) search mask -- the same test a pixel had to pass to be
+    # evaluated in this pair's consensus vote (see consensus.py).
+    consensus_window &= masking.load_flags_window(outcome.target_search_mask_path, outcome.tgt_window) == 0
+    consensus_window &= masking.load_flags_window(config.reference_search_mask_path, outcome.ref_window) == 0
 
     try:
         fitted, inlier_rasters = normalize.fit_regression_from_mask(
@@ -1029,8 +1053,9 @@ def _finalize_target_scene(scene: io.Scene, outcome: CandidateOutcome, config: P
             invariance_frequency_threshold=config.invariance_frequency_threshold,
             min_observations=config.min_observations, block_rows=config.block_rows,
             downsample_factor=config.target_downsample_factor,
-            outlier_relative_threshold=config.outlier_relative_threshold,
-            slope_bounds=config.slope_bounds, min_fit_pixels=config.min_fit_pixels,
+            outlier_abs_threshold_dn=config.outlier_abs_threshold_dn,
+            slope_bounds=config.slope_bounds, ransac_max_iterations=config.ransac_max_iterations,
+            min_fit_pixels=config.min_fit_pixels,
             return_inlier_masks=True,
         )
     except ValueError as exc:
@@ -1063,7 +1088,7 @@ def _finalize_target_scene(scene: io.Scene, outcome: CandidateOutcome, config: P
         else BandModel(band_name=name, slope=1.0, intercept=0.0, r2=float("nan"), n_invariant_pixels=0)
         for name in target_band_names
     ]
-    full_model = replace(fitted, band_names=target_band_names, bands=full_bands)
+    full_model = replace(fitted, band_names=target_band_names, bands=full_bands, fit_settings=_fit_settings(config))
 
     model_io.save_model(full_model, model_path)
     apply.apply_model(scene.analytic_path, full_model, normalized_path, target_band_names, block_rows=config.block_rows)
@@ -1254,9 +1279,10 @@ def run_pipeline(
     block_rows: int = io.DEFAULT_BLOCK_ROWS,
     downsample_targets: bool = False,
     downsample_resolution_m: float = 15.0,
-    outlier_relative_threshold: float | None = 0.05,
+    outlier_abs_threshold_dn: float | None = normalize.DEFAULT_OUTLIER_ABS_THRESHOLD_DN,
     use_log_transform: bool = True,
-    slope_bounds: tuple[float, float] | None = (0.8, 1.2),
+    slope_bounds: tuple[float, float] | None = normalize.DEFAULT_SLOPE_BOUNDS,
+    ransac_max_iterations: int = normalize.DEFAULT_RANSAC_MAX_ITERATIONS,
     min_fit_pixels: int = 500,
     device: Literal["auto", "cpu", "gpu"] = "auto",
     dsm_path: str | None = None,
@@ -1274,6 +1300,7 @@ def run_pipeline(
     force_registration: bool = False,  # attempt registration.register_to_reference even when is_grid_aligned is already True
     registration_params: registration.RegistrationParams | None = None,  # None == RegistrationParams() defaults
     preferred_imagery_manifest: str | None = None,  # preferred_imagery.csv: use accepted registered scenes in place of raw
+    recursive: bool = False,  # also discover scenes in input_folder's subfolders (e.g. raw/<product>/<period>/)
     scene_ids: set[str] | None = None,
     scenes: list[io.Scene] | None = None,
     log=print,
@@ -1281,7 +1308,7 @@ def run_pipeline(
     if scenes is not None:
         log(f"Using {len(scenes)} caller-supplied scenes (bypassing directory discovery).")
     else:
-        scenes = io.discover_scenes(input_folder)
+        scenes = io.discover_scenes(input_folder, recursive=recursive)
         if not scenes:
             raise ValueError(f"No scenes found in '{input_folder}'.")
         log(f"Discovered {len(scenes)} scenes.")
@@ -1374,9 +1401,10 @@ def run_pipeline(
         resume=resume,
         block_rows=block_rows,
         target_downsample_factor=target_downsample_factor,
-        outlier_relative_threshold=outlier_relative_threshold,
+        outlier_abs_threshold_dn=outlier_abs_threshold_dn,
         use_log_transform=use_log_transform,
         slope_bounds=slope_bounds,
+        ransac_max_iterations=ransac_max_iterations,
         min_fit_pixels=min_fit_pixels,
         device=resolved_device,
         dsm_path=dsm_path,

@@ -116,6 +116,9 @@ class NormalizationModel:
     invariance_frequency_threshold: float
     min_observations: int
     fitted_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    # The Phase C fit settings the model was made with (see
+    # pipeline._fit_settings); None for models saved before it was recorded.
+    fit_settings: dict | None = None
 
     def band(self, name: str) -> BandModel:
         for b in self.bands:
@@ -357,30 +360,30 @@ def reclassify_invariant_pixels(
     return reclassify_from_cache(cache, fit, band_indices_ref, ncp_threshold, xsize, ysize)
 
 
-_RANSAC_MIN_PREDICTION_MAGNITUDE = 1.0  # DN floor on |predicted| before dividing, avoids blowup near 0
+# Defaults for the per-band RANSAC fit (see fit_regression_from_mask).
+# 200 DN is 0.02 surface reflectance at PlanetScope's x10000 scaling.
+DEFAULT_OUTLIER_ABS_THRESHOLD_DN = 200.0
+DEFAULT_SLOPE_BOUNDS = (1 / 1.5, 1.5)
+DEFAULT_RANSAC_MAX_ITERATIONS = 10_000
 
 
-def _ransac_relative_inliers(
-    x: np.ndarray, y: np.ndarray, slope: float, intercept: float, outlier_relative_threshold: float,
+def _ransac_abs_inliers(
+    x: np.ndarray, y: np.ndarray, slope: float, intercept: float, outlier_abs_threshold_dn: float,
 ) -> np.ndarray:
     """Boolean inlier mask: True where the model's predicted reference value
-    (intercept + slope*target) is within `outlier_relative_threshold` (a
-    fraction, e.g. 0.05 == 5%) of the observed reference value, relative to
-    the *prediction* — not a fixed absolute DN difference. `predicted` is
-    floored in magnitude before dividing so a near-zero prediction can't
-    produce a spurious huge relative error.
-    """
+    (intercept + slope*target) is within `outlier_abs_threshold_dn` DN of
+    the observed reference value -- the same absolute tolerance for dark
+    and bright targets."""
     predicted = intercept + slope * x
-    denom = np.maximum(np.abs(predicted), _RANSAC_MIN_PREDICTION_MAGNITUDE)
-    return np.abs(y - predicted) / denom <= outlier_relative_threshold
+    return np.abs(y - predicted) <= outlier_abs_threshold_dn
 
 
 def _ransac_orthogonal_regression(
     x: np.ndarray,
     y: np.ndarray,
-    outlier_relative_threshold: float,
+    outlier_abs_threshold_dn: float,
     *,
-    max_iterations: int = 300,
+    max_iterations: int = DEFAULT_RANSAC_MAX_ITERATIONS,
     sample_size: int = 12,
     seed: int = 0,
     slope_bounds: tuple[float, float] | None = None,
@@ -389,11 +392,11 @@ def _ransac_orthogonal_regression(
 
     Repeatedly fits a candidate orthogonal-regression line from a small
     random subset of points, scores each candidate by how many of *all*
-    the points it explains within `outlier_relative_threshold` (a relative,
-    percentage-of-prediction threshold — see _ransac_relative_inliers, not
-    a fixed absolute DN difference, so the same threshold is equally
-    strict for dim and bright targets), and keeps whichever candidate model
-    has the most support. The winning inlier set is then refit once and
+    the points it explains within `outlier_abs_threshold_dn` (an absolute
+    difference between observed and predicted reference value, in DN --
+    see _ransac_abs_inliers), and keeps whichever candidate model has the
+    most support. It tries `max_iterations` candidates before settling on
+    the best found (or, if none was plausible, on no trimming). The winning inlier set is then refit once and
     re-scored against that refined model (a standard RANSAC "polish" step),
     so the minimal-sample candidate doesn't itself become the final answer.
 
@@ -441,7 +444,7 @@ def _ransac_orthogonal_regression(
             continue
         if slope_bounds is not None and not (slope_bounds[0] <= slope <= slope_bounds[1]):
             continue
-        inliers = _ransac_relative_inliers(x, y, slope, intercept, outlier_relative_threshold)
+        inliers = _ransac_abs_inliers(x, y, slope, intercept, outlier_abs_threshold_dn)
         count = int(inliers.sum())
         if count > best_count:
             best_count = count
@@ -471,7 +474,7 @@ def _ransac_orthogonal_regression(
         np.isfinite(slope1) and np.isfinite(intercept1)
         and (slope_bounds is None or (slope_bounds[0] <= slope1 <= slope_bounds[1]))
     ):
-        polished_mask = _ransac_relative_inliers(x, y, slope1, intercept1, outlier_relative_threshold)
+        polished_mask = _ransac_abs_inliers(x, y, slope1, intercept1, outlier_abs_threshold_dn)
         if polished_mask.sum() >= sample_size:
             best_mask = polished_mask
 
@@ -494,8 +497,9 @@ def fit_regression_from_mask(
     min_observations: int,
     block_rows: int = io.DEFAULT_BLOCK_ROWS,
     downsample_factor: int = 1,
-    outlier_relative_threshold: float | None = 0.05,
-    slope_bounds: tuple[float, float] | None = (0.8, 1.2),
+    outlier_abs_threshold_dn: float | None = DEFAULT_OUTLIER_ABS_THRESHOLD_DN,
+    slope_bounds: tuple[float, float] | None = DEFAULT_SLOPE_BOUNDS,
+    ransac_max_iterations: int = DEFAULT_RANSAC_MAX_ITERATIONS,
     min_fit_pixels: int = 500,
     return_inlier_masks: bool = False,
 ) -> NormalizationModel | tuple[NormalizationModel, dict[str, np.ndarray]]:
@@ -510,14 +514,14 @@ def fit_regression_from_mask(
     whatever coarsening was used to find the invariant targets in the first
     place — window/mask shapes are unaffected either way.
 
-    `outlier_relative_threshold` (default 0.05, i.e. 5%; pass None to
-    disable) drives a RANSAC pass per band (see _ransac_orthogonal_
-    regression): still an orthogonal-regression fit (neither image is
-    ground truth — both carry error, so a total-least-squares model form
-    is kept rather than switching to OLS), but the outlier criterion is now
-    *relative* to the model's own prediction rather than a fixed DN
-    difference, so the same threshold is equally strict for a dim road and
-    a bright roof.
+    `outlier_abs_threshold_dn` (default 200 DN, i.e. 0.02 surface
+    reflectance; pass None to disable) drives a RANSAC pass per band (see
+    _ransac_orthogonal_regression), of `ransac_max_iterations` candidate
+    fits: still an orthogonal-regression fit (neither image is ground
+    truth — both carry error, so a total-least-squares model form is kept
+    rather than switching to OLS), with a point an inlier when the
+    observed reference value is within that many DN of the model's
+    prediction.
 
     `slope_bounds` is also passed *into* the RANSAC search itself (see
     _ransac_orthogonal_regression): a candidate model is only eligible to
@@ -552,7 +556,7 @@ def fit_regression_from_mask(
     back to identity, so a rejected band's mask is still useful for seeing
     what RANSAC found (e.g. a small, spatially clustered inlier set is a
     different failure mode than a large-but-implausible one). When RANSAC
-    is disabled (`outlier_relative_threshold=None`), the mask is just the
+    is disabled (`outlier_abs_threshold_dn=None`), the mask is just the
     whole consensus set for that band.
     """
     if downsample_factor > 1:
@@ -628,9 +632,9 @@ def fit_regression_from_mask(
 
         n_outliers = 0
         inlier_mask = np.ones(x.size, dtype=bool)
-        if outlier_relative_threshold is not None:
+        if outlier_abs_threshold_dn is not None:
             x, y, n_outliers, inlier_mask = _ransac_orthogonal_regression(
-                x, y, outlier_relative_threshold, slope_bounds=slope_bounds,
+                x, y, outlier_abs_threshold_dn, slope_bounds=slope_bounds, max_iterations=ransac_max_iterations,
             )
 
         # before/after both computed over the same final (post-trim) point
