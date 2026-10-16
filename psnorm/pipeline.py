@@ -25,7 +25,8 @@ from typing import Literal
 
 import numpy as np
 
-from . import apply, backend, consensus, io, lidar_masks, masking, metrics, model_io, normalize, registration, sensors
+from . import (apply, backend, consensus, io, lidar_masks, masking, metrics, model_io, normalize, preferred_imagery,
+               registration, sensors)
 from .normalize import BandModel
 
 # --------------------------------------------------------------------------
@@ -1272,6 +1273,7 @@ def run_pipeline(
     mask_dilate_px: int = 1,
     force_registration: bool = False,  # attempt registration.register_to_reference even when is_grid_aligned is already True
     registration_params: registration.RegistrationParams | None = None,  # None == RegistrationParams() defaults
+    preferred_imagery_manifest: str | None = None,  # preferred_imagery.csv: use accepted registered scenes in place of raw
     scene_ids: set[str] | None = None,
     scenes: list[io.Scene] | None = None,
     log=print,
@@ -1293,6 +1295,17 @@ def run_pipeline(
         if not scenes:
             raise ValueError(f"None of the requested scene_ids were found in '{input_folder}'.")
         log(f"Restricted to {len(scenes)} scenes (scene_ids filter, e.g. one multi-reference group).")
+
+    if preferred_imagery_manifest is not None:
+        # Every step from here on reads each scene's preferred analytic
+        # raster (its accepted registered version, else the raw scene);
+        # UDM2 and metadata still come from the raw scene's folder. See
+        # psnorm.preferred_imagery.
+        scenes = preferred_imagery.apply_preferred_imagery(scenes, preferred_imagery_manifest, log=log)
+        if reference_path is not None:
+            # A reference given as its raw path follows its scene.
+            by_name = {os.path.basename(s.analytic_path): s.analytic_path for s in scenes}
+            reference_path = by_name.get(os.path.basename(reference_path), reference_path)
 
     resolved_device = backend.resolve_device(device)
     log(f"Device: {resolved_device}" + (f" (auto-detected from device={device!r})" if device == "auto" else ""))

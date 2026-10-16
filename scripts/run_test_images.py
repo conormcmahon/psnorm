@@ -62,6 +62,10 @@ def main():
     parser.add_argument("--force-registration", action="store_true",
                          help="register every target to the reference even when their grids already line up "
                               "(see psnorm.registration)")
+    parser.add_argument("--preferred-imagery-manifest", default=None,
+                         help="preferred_imagery.csv from a registration run (see psnorm.preferred_imagery): scenes whose "
+                              "registration was accepted are read from their registered file instead of the raw one "
+                              "(UDM2 and metadata still come from the raw folder)")
     registration.add_registration_arguments(parser)
     args = parser.parse_args()
 
@@ -98,6 +102,7 @@ def main():
         mask_dilate_px=args.mask_dilate_px,
         force_registration=args.force_registration,
         registration_params=registration.registration_params_from_args(args),
+        preferred_imagery_manifest=args.preferred_imagery_manifest,
     )
     elapsed = time.time() - start
 

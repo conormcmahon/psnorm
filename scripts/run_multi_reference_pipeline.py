@@ -11,7 +11,7 @@ Usage:
         [--dsm-path PATH] [--dsm-height-units m|ft] [--max-slope-deg F] \\
         [--roughness-window-radius-px N] [--roughness-max-deg F] \\
         [--use-shadow-mask] [--max-building-height-m F] [--shadow-ray-step-m F] \\
-        [--mask-erode-px N] [--mask-dilate-px N]
+        [--mask-erode-px N] [--mask-dilate-px N] [--preferred-imagery-manifest CSV]
 """
 
 import argparse
@@ -24,7 +24,7 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from psnorm import io as pio
-from psnorm import pipeline, registration
+from psnorm import pipeline, preferred_imagery, registration
 
 MAX_ATTEMPTS = 150
 RETRY_DELAY_S = 20.0
@@ -54,6 +54,7 @@ def _run_pipeline_kwargs(args):
         mask_dilate_px=args.mask_dilate_px,
         force_registration=args.force_registration,
         registration_params=registration.registration_params_from_args(args),
+        preferred_imagery_manifest=args.preferred_imagery_manifest,
     )
 
 
@@ -127,6 +128,10 @@ def main():
     parser.add_argument("--force-registration", action="store_true",
                          help="register every target to the reference even when their grids already line up "
                               "(see psnorm.registration)")
+    parser.add_argument("--preferred-imagery-manifest", default=None,
+                         help="preferred_imagery.csv from a registration run (see psnorm.preferred_imagery): scenes whose "
+                              "registration was accepted are read from their registered file instead of the raw one "
+                              "(UDM2 and metadata still come from the raw folder)")
     registration.add_registration_arguments(parser)
     args = parser.parse_args()
 
@@ -146,6 +151,10 @@ def main():
         log(f"Discovered {len(scenes)} scenes total.")
     if not scenes:
         raise ValueError(f"No scenes found for input '{args.input}'.")
+    if args.preferred_imagery_manifest:
+        # References are chosen, and footprints read, from the imagery the
+        # groups will actually use.
+        scenes = preferred_imagery.apply_preferred_imagery(scenes, args.preferred_imagery_manifest, log=log)
 
     log("Reading every scene's footprint (this is the only pass over all scenes' headers)...")
     bounds = pipeline.scene_bounds_map(scenes)

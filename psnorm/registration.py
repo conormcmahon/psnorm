@@ -56,8 +56,10 @@ class RegistrationParams:
     """Every setting that controls registration.
 
     psnorm-specific:
-      warp_model     "affine" (one global transform) or "tps" (local,
-                     non-rigid); see pgo.register_local. Only applies when
+      warp_model     "affine" (one global transform; the default, and the
+                     better of the two on the Philadelphia archive) or
+                     "tps" (local, non-rigid, only when asked for); see
+                     pgo.register_local. Only applies when
                      the target and reference already share a grid; the
                      not-grid-aligned case is always a global affine onto
                      the reference's grid.
@@ -229,6 +231,93 @@ def registration_params_from_args(args) -> RegistrationParams:
         if getattr(args, "registration_" + f.name, None) is not None
     }
     return replace(RegistrationParams(), **overrides)
+
+
+@dataclass(frozen=True)
+class RegistrationAcceptance:
+    """When a registered scene is used in place of its raw scene.
+
+    A registration is accepted only if all of these hold (each is checked
+    by registration_failed_checks):
+      - for every band in `bands`, whole-image R^2 against the reference is
+        higher and RMSE lower after registration than before (the "_all"
+        metrics -- every sampled pixel, not only the RANSAC inliers);
+      - the fitted affine's scale is within `max_abs_log_scale` of 1 on
+        both axes: abs(log(affine_scale_x)) and abs(log(affine_scale_y))
+        are below it (0.005 is about half a percent);
+      - the final (guided) RANSAC fit kept more than `min_ransac_inliers`
+        keypoint matches.
+    A scene whose registration fails any check keeps its raw imagery for
+    every later step.
+    """
+
+    bands: tuple[str, ...] = ("red", "nir")
+    max_abs_log_scale: float = 0.005
+    min_ransac_inliers: int = 1000
+
+
+def _number(value) -> float:
+    """float(value), or NaN for a missing / empty / unparseable value."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return math.nan
+
+
+def registration_failed_checks(metrics: dict, band_names: list[str], ransac_inliers,
+                               acceptance: RegistrationAcceptance = RegistrationAcceptance()) -> list[str]:
+    """The RegistrationAcceptance checks a registration fails (empty if it
+    is accepted).
+
+    `metrics` is planet_georeg_opencv's flat metrics for the scene -- a
+    RegistrationResult's `metrics`, or one row of an alignment_metrics CSV
+    merged with the manifest's affine_scale_x/affine_scale_y -- with per-
+    band keys such as "r2_band2_after_all" keyed by the 0-based band index
+    in the registered scene, whose bands are `band_names`.
+    `ransac_inliers` is the guided RANSAC inlier count. Values may be
+    strings (as read from CSV); a missing value fails its check.
+    """
+    failed = []
+    for band in acceptance.bands:
+        if band not in band_names:
+            failed.append(f"no_{band}_band")
+            continue
+        b = band_names.index(band)
+        r2_before, r2_after = (_number(metrics.get(f"r2_band{b}_{when}_all")) for when in ("before", "after"))
+        rmse_before, rmse_after = (_number(metrics.get(f"rmse_band{b}_{when}_all")) for when in ("before", "after"))
+        # NaN compares False, so a missing metric fails.
+        if not r2_after > r2_before:
+            failed.append(f"{band}_r2_not_improved")
+        if not rmse_after < rmse_before:
+            failed.append(f"{band}_rmse_not_improved")
+    for axis in ("x", "y"):
+        scale = _number(metrics.get(f"affine_scale_{axis}"))
+        if not (scale > 0 and abs(math.log(scale)) < acceptance.max_abs_log_scale):
+            failed.append(f"scale_{axis}_out_of_range")
+    if not _number(ransac_inliers) > acceptance.min_ransac_inliers:
+        failed.append("too_few_ransac_inliers")
+    return failed
+
+
+def add_acceptance_arguments(parser) -> None:
+    """Add `--accept-*` options for RegistrationAcceptance to a parser; read
+    them back with acceptance_from_args."""
+    default = RegistrationAcceptance()
+    group = parser.add_argument_group("registration acceptance (see psnorm.registration.RegistrationAcceptance)")
+    group.add_argument("--accept-bands", default=",".join(default.bands),
+                       help=f"bands whose whole-image R^2 and RMSE must both improve (default: {','.join(default.bands)})")
+    group.add_argument("--accept-max-abs-log-scale", type=float, default=default.max_abs_log_scale,
+                       help=f"largest abs(log(affine scale)) on either axis (default: {default.max_abs_log_scale})")
+    group.add_argument("--accept-min-ransac-inliers", type=int, default=default.min_ransac_inliers,
+                       help=f"guided RANSAC inliers must exceed this (default: {default.min_ransac_inliers})")
+
+
+def acceptance_from_args(args) -> RegistrationAcceptance:
+    return RegistrationAcceptance(
+        bands=tuple(b.strip() for b in args.accept_bands.split(",") if b.strip()),
+        max_abs_log_scale=args.accept_max_abs_log_scale,
+        min_ransac_inliers=args.accept_min_ransac_inliers,
+    )
 
 
 @dataclass

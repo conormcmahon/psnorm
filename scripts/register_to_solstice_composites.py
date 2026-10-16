@@ -3,11 +3,23 @@
 solstice median composite (psnorm.registration.register_scene_models),
 writing registered scenes plus registration metadata.
 
-One warp model (--registration-warp-model into --output-dir) or two
-(--also-warp-model into --also-output-dir): with two, each scene is read
-and matched once and both warps are applied to the same matched keypoints,
-which costs about a third more than one model rather than twice as much.
-Each output directory is complete in itself and laid out as below.
+The warp model is affine unless asked otherwise (--registration-warp-model
+tps). A second model can be run in the same pass (--also-warp-model into
+--also-output-dir): each scene is then read and matched once and both warps
+are applied to the same matched keypoints, which costs about a third more
+than one model rather than twice as much. Each output directory is complete
+in itself and laid out as below.
+
+Only registrations that improve on the raw scene are kept: each one is
+checked against psnorm.registration.RegistrationAcceptance (--accept-*
+options: red and NIR whole-image R^2 up and RMSE down, affine scale within
+0.5% of 1, more than 1000 RANSAC inliers), and by default
+(--save-registered accepted) a registered scene is written to the output
+directory only if it passes. It is first written to --staging-dir (local
+disk) and copied over once accepted, so rejected scenes cost no space or
+write time on the output drive. --save-registered all writes every
+completed registration, as runs before this option did. Raw scenes are
+never touched either way.
 
 For each scene under --raw-root's philadelphia4b/philadelphia8b period
 folders (the layout scripts/build_solstice_composite_reference.py reads),
@@ -31,6 +43,11 @@ Outputs, under --output-dir:
       scale/intercept before and after, mean shift), via its
       write_alignment_metrics_csv; split by band count because its columns
       are per band index
+  preferred_imagery.csv   written at the end of a run: for every scene, the
+      file later steps should read (its registered version if accepted and
+      written, otherwise the raw scene) and why a scene was not accepted --
+      see psnorm.preferred_imagery; pass it to the pipeline scripts'
+      --preferred-imagery-manifest
   run_params.json   the RegistrationParams and command line of the latest start
   run_params_history.jsonl  the same for every start
 
@@ -47,10 +64,10 @@ Usage:
     python scripts/register_to_solstice_composites.py \\
         --raw-root /mnt/e/E_Coast_PlanetScope/philadelphia/raw \\
         --composite-dir /mnt/e/E_Coast_PlanetScope/philadelphia/summer_solstice_composites \\
-        --output-dir /mnt/e/E_Coast_PlanetScope/philadelphia/affine_transform \\
-        --registration-warp-model affine \\
-        --also-warp-model tps \\
-        --also-output-dir /mnt/e/E_Coast_PlanetScope/philadelphia/tps_transform
+        --output-dir /mnt/e/E_Coast_PlanetScope/philadelphia/affine_transform
+
+    (add --also-warp-model tps --also-output-dir .../tps_transform to also
+    run TPS, as the Philadelphia run did)
 """
 
 from __future__ import annotations
@@ -76,6 +93,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from dataclasses import asdict, replace
@@ -92,7 +110,7 @@ from build_solstice_composite_reference import (  # noqa: E402
 )
 from planet_georeg_opencv import band_metrics, nd_index, tps_warp  # noqa: E402
 
-from psnorm import compositing, io, registration  # noqa: E402
+from psnorm import compositing, io, preferred_imagery, registration  # noqa: E402
 
 PRODUCTS = {"philadelphia4b": FOUR_BAND_SUFFIX, "philadelphia8b": EIGHT_BAND_SUFFIX}
 
@@ -118,6 +136,10 @@ MANIFEST_FIELDS = [
     # The warp models this scene was registered with in one pass (e.g.
     # "affine+tps"); `seconds` is the time for all of them together.
     "models_together",
+    # Whether the registration passed psnorm.registration.RegistrationAcceptance
+    # ("true"/"false"; empty if it did not complete), the checks it failed,
+    # and whether the registered scene was written to output_path.
+    "accepted", "failed_checks", "output_written",
 ]
 
 
@@ -224,20 +246,38 @@ def register_one(task: dict, params: registration.RegistrationParams, sift_lock_
         cv2.setNumThreads(threads)
     models = list(task["warp_outputs"])
     base_row = {k: task[k] for k in MANIFEST_FIELDS if k in task}
-    rows = {model: {**base_row, "warp_model": model, "output_path": task["warp_outputs"][model]} for model in models}
+    rows = {model: {**base_row, "warp_model": model, "output_path": task["warp_outputs"][model],
+                    "output_written": False} for model in models}
     metrics_out = {model: None for model in models}
+    acceptance = registration.RegistrationAcceptance(**task.get("acceptance", {}))
+    staging_dir = task.get("staging_dir")
+    # With a staging directory, each model is written there first and copied
+    # to its output path only if accepted (see the module docstring).
+    write_to = ({model: os.path.join(staging_dir, f"{task['scene_id']}_{model}.tif") for model in models}
+                if staging_dir else dict(task["warp_outputs"]))
     try:
         # Each output is written band by band as the scene is warped, and
         # only if registration succeeds (register_scene_models re-reads
         # it, and rewrites it once if that fails).
-        for path in task["warp_outputs"].values():
+        for path in write_to.values():
             os.makedirs(os.path.dirname(path), exist_ok=True)
         scenes = registration.register_scene_models(
-            task["analytic_path"], task["reference_path"], task["warp_outputs"], params,
+            task["analytic_path"], task["reference_path"], write_to, params,
             target_udm2_path=task["udm2_path"], sift_lock=FileLock(sift_lock_path) if sift_lock_path else None,
         )
         for model, reg in scenes.items():
             result, row = reg.result, rows[model]
+            if result.status == "ok":
+                failed = registration.registration_failed_checks(
+                    result.metrics, reg.band_names, result.diagnostics.get("guided_ransac_inliers"), acceptance)
+                row.update(accepted=str(not failed).lower(), failed_checks=";".join(failed))
+                if staging_dir and not failed:
+                    final = task["warp_outputs"][model]
+                    os.makedirs(os.path.dirname(final), exist_ok=True)
+                    # A copy, not a move: renames onto the output mount are
+                    # unreliable. The staged file was verified when written.
+                    shutil.copyfile(write_to[model], final)
+                row["output_written"] = bool(reg.output_path) and (not staging_dir or not failed)
             row.update(
                 status=result.status, message=result.message, strategy=reg.strategy,
                 udm2_mask_used=reg.target_mask_used,
@@ -266,8 +306,15 @@ def register_one(task: dict, params: registration.RegistrationParams, sift_lock_
     except Exception as exc:  # recorded per scene rather than aborting the batch
         for row in rows.values():
             row.update(status="error", message=f"{type(exc).__name__}: {exc} | {traceback.format_exc(limit=3)!r}")
+    finally:
+        if staging_dir:
+            for path in write_to.values():
+                if os.path.exists(path):
+                    os.remove(path)
     seconds = round(time.time() - t0, 1)
     for row in rows.values():
+        if not row["output_written"]:
+            row["output_path"] = ""
         # The whole scene's time, for every model run with it (see
         # models_together): matching is shared, so it cannot be split.
         row["seconds"] = seconds
@@ -646,7 +693,15 @@ def main():
                         help="defer scenes whose reference composite is still in the old strip layout "
                              "(use while scripts/rewrite_composites.py is still working through them)")
     parser.add_argument("--progress-interval-s", type=float, default=120)
+    parser.add_argument("--save-registered", default="accepted", choices=["accepted", "all"],
+                        help="which completed registrations to write: only those passing the --accept-* checks "
+                             "(default), or all of them")
+    parser.add_argument("--staging-dir", default=os.path.join(tempfile.gettempdir(), "psnorm_registration_staging"),
+                        help="local directory registered scenes are written to before an accepted one is copied to "
+                             "the output directory (--save-registered accepted only); needs room for one scene per "
+                             "worker")
     registration.add_registration_arguments(parser)
+    registration.add_acceptance_arguments(parser)
     args = parser.parse_args()
 
     if args.threads_per_worker > 0:
@@ -657,6 +712,8 @@ def main():
             os.environ[name] = str(args.threads_per_worker)
 
     params = registration.registration_params_from_args(args)
+    acceptance = registration.acceptance_from_args(args)
+    staging_dir = args.staging_dir if args.save_registered == "accepted" else None
     if (args.also_warp_model is None) != (args.also_output_dir is None):
         parser.error("--also-warp-model and --also-output-dir go together")
     if args.also_warp_model == params.warp_model:
@@ -670,7 +727,8 @@ def main():
 
     for model, output_dir in output_dirs.items():
         os.makedirs(output_dir, exist_ok=True)
-        run_record = {"registration_params": asdict(replace(params, warp_model=model)), "argv": sys.argv,
+        run_record = {"registration_params": asdict(replace(params, warp_model=model)),
+                      "acceptance": asdict(acceptance), "save_registered": args.save_registered, "argv": sys.argv,
                       "warp_models_this_run": list(output_dirs), "started": datetime.now().isoformat()}
         with open(os.path.join(output_dir, "run_params.json"), "w") as f:
             json.dump(run_record, f, indent=2)
@@ -707,7 +765,7 @@ def main():
             or (args.retry_failed and recorded[model][t["scene_id"]] != "ok")
         ]
         if missing:
-            pending.append({**t, "warp_outputs": {
+            pending.append({**t, "acceptance": asdict(acceptance), "staging_dir": staging_dir, "warp_outputs": {
                 model: os.path.join(output_dirs[model], t["output_relpath"]) for model in missing}})
     pending = large_last(pending, args.large_mpx)
     n_unrecorded = len(pending)
@@ -725,6 +783,10 @@ def main():
     run(pending, params, recorders, progress, args.workers, args.memory_budget_gb, args.base_gb, args.gb_per_mpx,
         CompositeReadiness(args.require_rewritten_composites), args.sift_lock_file or None,
         limits_file=args.limits_file, max_workers=max(args.max_workers, args.workers))
+    for model, output_dir in output_dirs.items():
+        path, rows = preferred_imagery.write_preferred_imagery(output_dir, acceptance)
+        n_registered = sum(r["preferred_source"] == "registered" for r in rows)
+        print(f"{model}: {n_registered} of {len(rows)} scenes use their registered version; wrote {path}", flush=True)
     print(f"DONE {datetime.now().isoformat()}", flush=True)
 
 
