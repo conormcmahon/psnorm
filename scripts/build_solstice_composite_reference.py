@@ -73,12 +73,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import math
 import multiprocessing
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import numpy as np
 from osgeo import gdal, osr
@@ -86,6 +85,7 @@ from osgeo import gdal, osr
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from psnorm import compositing, io, sensors  # noqa: E402
+from psnorm.composite_reference import summer_solstice  # noqa: E402,F401 -- also imported from here by other scripts
 
 gdal.UseExceptions()
 osr.UseExceptions()
@@ -161,52 +161,6 @@ def compute_domain_centroid(scenes: list[io.Scene], *, log=print) -> tuple[float
     log(f"Read {len(lons)}/{len(scenes)} scene headers in {time.time() - t0:.1f}s "
         f"(metadata only -- no imagery loaded).")
     return float(np.median(lons)), float(np.median(lats))
-
-
-# --------------------------------------------------------------------------
-# Summer solstice date (Meeus low-precision mean solstice/equinox formula)
-# --------------------------------------------------------------------------
-
-def _jde_to_datetime(jde: float) -> datetime:
-    """Julian Ephemeris Day -> UTC calendar datetime (Meeus, Astronomical
-    Algorithms ch.7's standard JD-to-Gregorian-calendar algorithm)."""
-    jde = jde + 0.5
-    z = math.floor(jde)
-    f = jde - z
-    if z < 2299161:
-        a = z
-    else:
-        alpha = math.floor((z - 1867216.25) / 36524.25)
-        a = z + 1 + alpha - math.floor(alpha / 4)
-    b = a + 1524
-    c = math.floor((b - 122.1) / 365.25)
-    d = math.floor(365.25 * c)
-    e = math.floor((b - d) / 30.6001)
-    day = b - d - math.floor(30.6001 * e) + f
-    month = e - 1 if e < 14 else e - 13
-    year = c - 4716 if month > 2 else c - 4715
-    day_int = int(math.floor(day))
-    seconds = round((day - day_int) * 86400)
-    return datetime(int(year), int(month), day_int) + timedelta(seconds=seconds)
-
-
-def summer_solstice(year: int, hemisphere: str) -> datetime:
-    """UTC instant of the summer solstice for `hemisphere` ('N' -> the
-    June solstice, 'S' -> the December solstice) in `year`, via Meeus's
-    low-precision mean-solstice polynomial (Astronomical Algorithms
-    ch.27, valid 1000-3000 CE). This omits the ~24-term periodic
-    correction Meeus adds for sub-hour precision -- the mean value alone
-    is already accurate to well under a day (checked here against the
-    known June 2018/2024 solstices), which is all a two-week selection
-    window needs."""
-    if hemisphere not in ("N", "S"):
-        raise ValueError(f"hemisphere must be 'N' or 'S', got {hemisphere!r}")
-    yp = (year - 2000) / 1000.0
-    if hemisphere == "N":
-        jde = 2451716.56767 + 365241.62603 * yp + 0.00325 * yp**2 + 0.00888 * yp**3 - 0.00030 * yp**4
-    else:
-        jde = 2451900.05952 + 365242.74049 * yp - 0.06223 * yp**2 - 0.00823 * yp**3 + 0.00032 * yp**4
-    return _jde_to_datetime(jde)
 
 
 def group_by_solstice_year(

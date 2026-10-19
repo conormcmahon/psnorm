@@ -58,6 +58,43 @@ def _run_pipeline_kwargs(args):
     )
 
 
+def add_pipeline_arguments(parser):
+    """The run_pipeline options this script and
+    scripts/run_composite_reference_pipeline.py share (see
+    _run_pipeline_kwargs)."""
+    parser.add_argument("--no-omnicloudmask", action="store_true")
+    parser.add_argument("--workers", default="cpu")
+    parser.add_argument("--resume", default="validate", choices=["no", "yes", "validate"])
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"])
+    parser.add_argument("--ncp-threshold", type=float, default=0.70)
+    parser.add_argument("--invariance-frequency-threshold", type=float, default=0.5)
+    parser.add_argument("--dsm-path", default=None)
+    parser.add_argument("--dsm-height-units", default="m", choices=["m", "ft"])
+    parser.add_argument("--max-slope-deg", type=float, default=5.0)
+    parser.add_argument("--roughness-window-radius-px", type=int, default=2)
+    parser.add_argument("--roughness-max-deg", type=float, default=10.0)
+    parser.add_argument("--use-shadow-mask", action="store_true")
+    parser.add_argument("--max-building-height-m", type=float, default=150.0)
+    parser.add_argument("--shadow-ray-step-m", type=float, default=None)
+    parser.add_argument("--mask-erode-px", type=int, default=1)
+    parser.add_argument("--mask-dilate-px", type=int, default=1)
+    parser.add_argument("--force-registration", action="store_true",
+                         help="register every target to the reference even when their grids already line up "
+                              "(see psnorm.registration)")
+    parser.add_argument("--preferred-imagery-manifest", default=None,
+                         help="preferred_imagery.csv from a registration run (see psnorm.preferred_imagery): scenes whose "
+                              "registration was accepted are read from their registered file instead of the raw one "
+                              "(UDM2 and metadata still come from the raw folder)")
+    registration.add_registration_arguments(parser)
+
+
+def workers_from_args(args):
+    """--workers as run_pipeline takes it: "cpu", None ("none"), or a count."""
+    if args.workers in ("cpu", "none", None):
+        return None if args.workers == "none" else "cpu"
+    return int(args.workers)
+
+
 def _run_group_with_retries(args, workers, all_scenes, reference, group_scenes):
     """Run (or resume) the pipeline for one reference group, retrying on
     transient I/O errors (mount hiccups, transient permission/file-descriptor
@@ -108,41 +145,14 @@ def main():
     parser.add_argument("--scene-log", default=None,
                          help="read candidate scene IDs from a prior run's log instead of listing --input's "
                               "directory (see psnorm.io.scene_ids_from_log)")
-    parser.add_argument("--no-omnicloudmask", action="store_true")
-    parser.add_argument("--workers", default="cpu")
-    parser.add_argument("--resume", default="validate", choices=["no", "yes", "validate"])
-    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"])
-    parser.add_argument("--ncp-threshold", type=float, default=0.70)
-    parser.add_argument("--invariance-frequency-threshold", type=float, default=0.5)
-    parser.add_argument("--dsm-path", default=None)
-    parser.add_argument("--dsm-height-units", default="m", choices=["m", "ft"])
-    parser.add_argument("--max-slope-deg", type=float, default=5.0)
-    parser.add_argument("--roughness-window-radius-px", type=int, default=2)
-    parser.add_argument("--roughness-max-deg", type=float, default=10.0)
-    parser.add_argument("--use-shadow-mask", action="store_true")
-    parser.add_argument("--max-building-height-m", type=float, default=150.0)
-    parser.add_argument("--shadow-ray-step-m", type=float, default=None)
-    parser.add_argument("--mask-erode-px", type=int, default=1)
-    parser.add_argument("--mask-dilate-px", type=int, default=1)
+    add_pipeline_arguments(parser)
     parser.add_argument("--max-references", type=int, default=30)
-    parser.add_argument("--force-registration", action="store_true",
-                         help="register every target to the reference even when their grids already line up "
-                              "(see psnorm.registration)")
     parser.add_argument("--recursive", action="store_true",
                          help="also find scenes in --input's subfolders, e.g. a raw archive laid out as "
                               "<product>/<period>/ (4- and 8-band scenes are both found either way)")
-    parser.add_argument("--preferred-imagery-manifest", default=None,
-                         help="preferred_imagery.csv from a registration run (see psnorm.preferred_imagery): scenes whose "
-                              "registration was accepted are read from their registered file instead of the raw one "
-                              "(UDM2 and metadata still come from the raw folder)")
-    registration.add_registration_arguments(parser)
     args = parser.parse_args()
 
-    workers = args.workers
-    if workers in ("cpu", "none", None):
-        workers = None if workers == "none" else "cpu"
-    else:
-        workers = int(workers)
+    workers = workers_from_args(args)
 
     if args.scene_log and args.recursive:
         parser.error("--scene-log looks scenes up in --input itself only; it cannot be combined with --recursive")

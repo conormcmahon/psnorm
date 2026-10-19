@@ -25,8 +25,8 @@ from typing import Literal
 
 import numpy as np
 
-from . import (apply, backend, consensus, io, lidar_masks, masking, metrics, model_io, normalize, preferred_imagery,
-               registration, sensors)
+from . import (apply, backend, composite_reference, consensus, io, lidar_masks, masking, metrics, model_io, normalize,
+               preferred_imagery, registration, sensors)
 from .normalize import BandModel
 
 # --------------------------------------------------------------------------
@@ -478,6 +478,7 @@ class PipelineConfig:
     reference_search_mask_path: str
     reference_band_names: tuple[str, ...]
     output_dir: str
+    reference_is_composite: bool  # reference is a composite (see run_pipeline's reference_composite), not a scene
     use_water_mask: bool
     ndwi_threshold: float
     use_vegetation_mask: bool
@@ -611,15 +612,28 @@ def _compute_and_save_flags(scene: io.Scene, band_names: list[str], config: Pipe
     lidar_rough = lidar["roughness"] if lidar else None
     lidar_shadow = lidar.get("shadow") if lidar else None
 
-    flags = masking.compute_exclusion_flags(
-        scene.analytic_path, scene.udm2_path, band_names,
-        use_water_mask=config.use_water_mask, ndwi_threshold=config.ndwi_threshold,
-        use_vegetation_mask=config.use_vegetation_mask, ndvi_threshold=config.ndvi_threshold,
-        use_omnicloudmask=config.use_omnicloudmask,
-        omnicloud_downsample_factor=config.omnicloud_downsample_factor,
-        omnicloud_kwargs=config.omnicloud_kwargs,
-        lidar_slope_excluded=lidar_slope, lidar_rough_excluded=lidar_rough, lidar_shadow_excluded=lidar_shadow,
-    )
+    if config.reference_is_composite and scene.analytic_path == config.reference_analytic_path:
+        # A composite reference: no UDM2/OmniCloudMask, and read in row
+        # blocks (see masking.compute_composite_exclusion_flags).
+        flags = masking.compute_composite_exclusion_flags(
+            scene.analytic_path, band_names,
+            use_water_mask=config.use_water_mask, ndwi_threshold=config.ndwi_threshold,
+            use_vegetation_mask=config.use_vegetation_mask, ndvi_threshold=config.ndvi_threshold,
+            block_rows=config.block_rows,
+        )
+        for excluded, bit in ((lidar_slope, masking.EXCLUDE_LIDAR_SLOPE), (lidar_rough, masking.EXCLUDE_LIDAR_ROUGH)):
+            if excluded is not None:
+                flags |= excluded.astype(np.uint8) * bit
+    else:
+        flags = masking.compute_exclusion_flags(
+            scene.analytic_path, scene.udm2_path, band_names,
+            use_water_mask=config.use_water_mask, ndwi_threshold=config.ndwi_threshold,
+            use_vegetation_mask=config.use_vegetation_mask, ndvi_threshold=config.ndvi_threshold,
+            use_omnicloudmask=config.use_omnicloudmask,
+            omnicloud_downsample_factor=config.omnicloud_downsample_factor,
+            omnicloud_kwargs=config.omnicloud_kwargs,
+            lidar_slope_excluded=lidar_slope, lidar_rough_excluded=lidar_rough, lidar_shadow_excluded=lidar_shadow,
+        )
     masking.save_flags_raster(flags, info, path)
 
     if lidar_slope is not None:
@@ -1260,6 +1274,10 @@ def run_pipeline(
     output_folder: str,
     *,
     reference_path: str | None = None,
+    reference_composite: str | None = None,
+    composite_stat: str = "median",
+    composite_cache_dir: str | None = None,
+    min_composite_band_coverage: float = composite_reference.DEFAULT_MIN_BAND_COVERAGE,
     band_names: list[str] | None = None,
     zenith_percentile: float = 10.0,
     zenith_percentile_step: float = 10.0,
@@ -1309,6 +1327,19 @@ def run_pipeline(
     scenes: list[io.Scene] | None = None,
     log=print,
 ) -> PipelineResult:
+    """Normalize every scene to one reference: a scene (`reference_path`,
+    else auto-selected -- see select_reference) or, with
+    `reference_composite`, a multi-statistic composite such as
+    solstice_2023.tif (see psnorm.composite_reference). A composite is read
+    through its `composite_stat` bands (ensure_single_stat_cache, in
+    `composite_cache_dir` if given), keeping only the bands valid over at
+    least `min_composite_band_coverage` of its area (see
+    composite_reference.present_bands); every scene is then a target, and
+    no reference output is written. The composite must share the scenes'
+    pixel grid (or registration runs -- see force_registration).
+    """
+    if reference_path is not None and reference_composite is not None:
+        raise ValueError("Pass reference_path or reference_composite, not both.")
     if scenes is not None:
         log(f"Using {len(scenes)} caller-supplied scenes (bypassing directory discovery).")
     else:
@@ -1348,22 +1379,44 @@ def run_pipeline(
             f"small number) when device='gpu'/'auto' resolves to gpu."
         )
 
-    reference_scene = select_reference(
-        scenes, reference_path=reference_path, zenith_percentile=zenith_percentile,
-        zenith_percentile_step=zenith_percentile_step, min_reference_area_km2=min_reference_area_km2,
-        use_water_mask=use_water_mask, ndwi_threshold=ndwi_threshold,
-        use_vegetation_mask=use_vegetation_mask, ndvi_threshold=ndvi_threshold,
-        use_omnicloudmask=use_omnicloudmask, omnicloud_downsample_factor=omnicloud_downsample_factor,
-        omnicloud_kwargs=omnicloud_kwargs, log=log,
-    )
-    log(f"Reference scene: {reference_scene.scene_id}")
+    for sub in ("masks", "candidates", "consensus", "models", "normalized", "ransac_inliers"):
+        os.makedirs(os.path.join(output_folder, sub), exist_ok=True)
+
+    if reference_composite is not None:
+        coverage = composite_reference.band_coverage(reference_composite, stat=composite_stat,
+                                                     cache_dir=composite_cache_dir)
+        present = composite_reference.present_bands(coverage, min_composite_band_coverage)
+        absent = [b for b in coverage if b not in present]
+        if band_names is not None:
+            unavailable = [b for b in band_names if b not in present]
+            if unavailable:
+                raise ValueError(f"Composite '{reference_composite}' lacks valid data for band(s) {unavailable!r} "
+                                 f"(band coverage: {coverage})")
+        else:
+            band_names = present
+        reference_raster = composite_reference.ensure_reference_raster(
+            reference_composite, band_names, os.path.join(output_folder, "reference"),
+            stat=composite_stat, cache_dir=composite_cache_dir,
+        )
+        name = os.path.splitext(os.path.basename(reference_composite))[0]
+        reference_scene = io.Scene(scene_id=name, analytic_path=reference_raster, udm2_path=None,
+                                   metadata_path=None, acquired=None)
+        log(f"Reference composite: {reference_composite} ({composite_stat} bands, read via {reference_raster})"
+            + (f"; bands without valid data, left out: {absent}" if absent else ""))
+    else:
+        reference_scene = select_reference(
+            scenes, reference_path=reference_path, zenith_percentile=zenith_percentile,
+            zenith_percentile_step=zenith_percentile_step, min_reference_area_km2=min_reference_area_km2,
+            use_water_mask=use_water_mask, ndwi_threshold=ndwi_threshold,
+            use_vegetation_mask=use_vegetation_mask, ndvi_threshold=ndvi_threshold,
+            use_omnicloudmask=use_omnicloudmask, omnicloud_downsample_factor=omnicloud_downsample_factor,
+            omnicloud_kwargs=omnicloud_kwargs, log=log,
+        )
+        log(f"Reference scene: {reference_scene.scene_id}")
 
     if band_names is None:
         band_names = sensors.detect_band_names(reference_scene.analytic_path)
     log(f"Reference band names: {band_names}")
-
-    for sub in ("masks", "candidates", "consensus", "models", "normalized", "ransac_inliers"):
-        os.makedirs(os.path.join(output_folder, sub), exist_ok=True)
 
     # Downsampling (if enabled) only coarsens the pixel values IR-MAD/the
     # regression see when searching for targets and fitting correction
@@ -1389,6 +1442,7 @@ def run_pipeline(
         reference_search_mask_path=reference_search_mask_path,
         reference_band_names=tuple(band_names),
         output_dir=output_folder,
+        reference_is_composite=reference_composite is not None,
         use_water_mask=use_water_mask,
         ndwi_threshold=ndwi_threshold,
         use_vegetation_mask=use_vegetation_mask,
@@ -1435,8 +1489,11 @@ def run_pipeline(
     _compute_and_save_flags(reference_scene, band_names, config)
     log(f"Reference exclusion flags: {reference_flags_path}")
 
-    reference_result = _process_reference_scene(reference_scene, band_names, config)
-    log(f"  {reference_scene.scene_id}: {reference_result.status}")
+    if reference_composite is None:
+        reference_result = _process_reference_scene(reference_scene, band_names, config)
+        log(f"  {reference_scene.scene_id}: {reference_result.status}")
+    else:
+        reference_result = None  # nothing to normalize or write for a composite
 
     targets = [s for s in scenes if s.scene_id != reference_scene.scene_id]
 
@@ -1475,11 +1532,12 @@ def run_pipeline(
     n_consensus_pixels = int(consensus_result.consensus_mask.sum())
     log(f"  consensus invariant targets: {n_consensus_pixels} pixels")
 
-    reference_result.spectral_coverage = normalize.compute_spectral_coverage(
-        reference_scene.analytic_path, (0, 0, ref_info.width, ref_info.height),
-        [sensors.band_index(band_names, b) for b in band_names], band_names,
-        consensus_result.consensus_mask, block_rows=block_rows,
-    )
+    if reference_result is not None:
+        reference_result.spectral_coverage = normalize.compute_spectral_coverage(
+            reference_scene.analytic_path, (0, 0, ref_info.width, ref_info.height),
+            [sensors.band_index(band_names, b) for b in band_names], band_names,
+            consensus_result.consensus_mask, block_rows=block_rows,
+        )
 
     log(f"Phase C: final regression fit + full-scene apply, {len(detected)} scenes...")
     n_done_c = [0]
@@ -1495,7 +1553,7 @@ def run_pipeline(
         SceneResult(scene.scene_id, outcome.status, message=outcome.message)
         for scene, outcome in zip(targets, candidate_outcomes) if outcome.status != "detected"
     ]
-    all_results = [reference_result] + target_results + skipped_results
+    all_results = ([reference_result] if reference_result is not None else []) + target_results + skipped_results
     results_by_id = {r.scene_id: r for r in all_results}
 
     usable = [

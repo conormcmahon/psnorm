@@ -191,7 +191,13 @@ class CachedWindow:
     source rasters, re-decompressing) the same pixels over and over.
 
     `blocks` is a list of (row_off, n_rows, tile_ref, tile_tgt, keep)
-    tuples, one per row-block (matching io.iter_row_blocks) — kept
+    tuples, one per row-block (matching io.iter_row_blocks). `keep` is the
+    block's boolean mask of pixels IR-MAD uses (in the search mask, nonzero
+    in both images); `tile_ref`/`tile_tgt` hold only those pixels' rows, as
+    float32 (as_float64 widens them for computation). Every consumer only
+    ever uses the kept pixels, and storing just those, at half width, is
+    what keeps a large 8-band scene's cache to a few GB at most rather than
+    16 bytes per band per window pixel. Blocks are kept
     block-chunked (not concatenated into one array) purely so the read
     itself stays bounded by block_rows * width * bands rather than needing
     the whole window materialized to build one contiguous array; every
@@ -204,6 +210,11 @@ class CachedWindow:
 
     blocks: list
     device: str
+
+
+def as_float64(tile, xp=np):
+    """A cached (float32) tile widened back to float64 for computation."""
+    return tile.astype(xp.float64)
 
 
 def _load_window_cache(
@@ -231,11 +242,13 @@ def _load_window_cache(
         mask_block = valid_mask[row_off : row_off + n_rows, :].ravel()
         keep = mask_block & tile_ref_raw.any(axis=1) & tile_tgt_raw.any(axis=1)
 
+        tile_ref_raw, tile_tgt_raw = tile_ref_raw[keep], tile_tgt_raw[keep]
         if log_transform:
             tile_ref = _log_transform_tile(tile_ref_raw)
             tile_tgt = _log_transform_tile(tile_tgt_raw)
         else:
             tile_ref, tile_tgt = tile_ref_raw, tile_tgt_raw
+        tile_ref, tile_tgt = tile_ref.astype(np.float32), tile_tgt.astype(np.float32)
 
         if xp is not np:
             tile_ref = xp.asarray(tile_ref)
@@ -336,14 +349,17 @@ def fit_irmad(
     n_iterations = 0
     while n_iterations < max_iter:
         try:
-            for row_off, n_rows, tile_ref, tile_tgt, keep in cache.blocks:
+            for _row_off, _n_rows, cached_ref, cached_tgt, _keep in cache.blocks:
+                if cached_ref.shape[0] == 0:
+                    continue
+                tile_ref, tile_tgt = as_float64(cached_ref, xp), as_float64(cached_tgt, xp)
                 if fit is not None:
                     chisqr = mad_chisqr(tile_ref, tile_tgt, fit, xp=xp)
                     weights_host = stats.chi2.sf(backend.to_host(chisqr), n_bands)
                     weights = xp.asarray(weights_host) if xp is not np else weights_host
-                    cov.update(xp.concatenate([tile_ref[keep], tile_tgt[keep]], axis=1), weights[keep])
+                    cov.update(xp.concatenate([tile_ref, tile_tgt], axis=1), weights)
                 else:
-                    cov.update(xp.concatenate([tile_ref[keep], tile_tgt[keep]], axis=1))
+                    cov.update(xp.concatenate([tile_ref, tile_tgt], axis=1))
 
             S = backend.to_host(cov.covariance())
             means = backend.to_host(cov.means())

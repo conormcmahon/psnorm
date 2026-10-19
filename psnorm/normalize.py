@@ -181,10 +181,14 @@ def _classify_from_cache(
     n_evaluated = 0
     n_invariant = 0
     for row_off, n_rows, tile_ref, tile_tgt, keep in cache.blocks:
-        chisqr = backend.to_host(irmad.mad_chisqr(tile_ref, tile_tgt, fit, xp=xp))
+        # The cache holds only the kept pixels (see irmad.CachedWindow).
         keep_host = backend.to_host(keep)
         n_evaluated += int(keep_host.sum())
-        invariant = keep_host & select_invariant_pixels(chisqr, dof, ncp_threshold)
+        invariant = np.zeros(keep_host.shape, dtype=bool)
+        if tile_ref.shape[0]:
+            chisqr = backend.to_host(irmad.mad_chisqr(
+                irmad.as_float64(tile_ref, xp), irmad.as_float64(tile_tgt, xp), fit, xp=xp))
+            invariant[keep_host] = select_invariant_pixels(chisqr, dof, ncp_threshold)
         n_invariant += int(invariant.sum())
         invariant_mask[row_off : row_off + n_rows, :] = invariant.reshape(n_rows, xsize)
     return invariant_mask, n_evaluated, n_invariant
@@ -767,13 +771,18 @@ def compute_spectral_coverage(
 
     info = io.get_raster_info(image_path)
     full_window = (0, 0, info.width, info.height)
-    whole = io.read_window_bands(image_path, full_window, band_indices)  # (bands, y, x)
-    whole_valid = masking.read_nodata_valid_mask(image_path, full_window)
+    # The whole scene's statistics, one band at a time and with the nodata
+    # mask read in row blocks: all bands of a large 8-band scene at once,
+    # as float64, are several GB.
+    whole_valid = np.empty((info.height, info.width), dtype=bool)
+    for row_off, n_rows in io.iter_row_blocks(info.height, block_rows):
+        whole_valid[row_off:row_off + n_rows] = masking.read_nodata_valid_mask(
+            image_path, (0, row_off, info.width, n_rows))
 
     results = []
     for b, name in enumerate(band_names):
         t_vals = np.concatenate(target_values[b]) if target_values[b] else np.array([])
-        whole_vals = whole[b][whole_valid]
+        whole_vals = io.read_window_bands(image_path, full_window, [band_indices[b]])[0][whole_valid]
 
         n_t = int(t_vals.size)
         t_var = float(np.var(t_vals, ddof=1)) if n_t >= 2 else float("nan")

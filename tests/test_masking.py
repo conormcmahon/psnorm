@@ -1,6 +1,7 @@
 import json
 
 import numpy as np
+from osgeo import gdal
 
 from psnorm import io, masking
 
@@ -129,3 +130,33 @@ def test_scene_clear_fraction_falls_back_to_udm2(tmp_path):
         metadata_path=None, acquired=None,
     )
     assert masking.scene_clear_fraction(scene) == 0.7
+
+
+def test_row_blocked_flags_match_whole_raster_masks(tmp_path):
+    """compute_exclusion_flags (row blocks of 7) gives the same nodata/water/
+    vegetation bits as the whole-raster mask functions; a composite's NaN
+    pixel also counts as nodata."""
+    import warnings as _warnings
+    rng = np.random.default_rng(5)
+    names = ["blue", "green", "red", "nir"]
+    arrays = [rng.integers(1, 3000, (23, 17)).astype(np.uint16) for _ in range(4)]
+    arrays[0][3:6, 2:9] = 0
+    scene = write_geotiff(str(tmp_path / "s.tif"), arrays, band_descriptions=names, nodata=0)
+    window = (0, 0, 17, 23)
+    expected = ((~masking.read_nodata_valid_mask(scene, window)).astype(np.uint8) * masking.EXCLUDE_NODATA
+                | masking.compute_ndwi_water_mask(scene, window, names).astype(np.uint8) * masking.EXCLUDE_WATER
+                | masking.compute_ndvi_vegetation_mask(scene, window, names).astype(np.uint8) * masking.EXCLUDE_VEGETATION)
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore")
+        blocked = masking.compute_exclusion_flags(scene, None, names, use_omnicloudmask=False, block_rows=7)
+    np.testing.assert_array_equal(blocked, expected)
+    assert (blocked & masking.EXCLUDE_WATER).any() and (blocked & masking.EXCLUDE_VEGETATION).any()
+
+    floats = [a.astype(np.float32) for a in arrays]
+    floats[0][3:6, 2:9] = -9999.0
+    floats[2][10, 10] = np.nan
+    composite = write_geotiff(str(tmp_path / "c.tif"), floats, band_descriptions=names, nodata=-9999.0,
+                              dtype=gdal.GDT_Float32)
+    composite_flags = masking.compute_composite_exclusion_flags(composite, names, block_rows=7)
+    expected[10, 10] |= masking.EXCLUDE_NODATA
+    np.testing.assert_array_equal(composite_flags, expected)

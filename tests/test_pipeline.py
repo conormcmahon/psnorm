@@ -521,3 +521,52 @@ def test_saved_model_with_different_ransac_settings_is_refit(tmp_path):
     changed = pipeline.run_pipeline(str(input_dir), str(output_dir), resume="validate",
                                     outlier_abs_threshold_dn=150.0, **kwargs)
     assert {r.scene_id: r.status for r in changed.scene_results}["20240102_120000_tgt"] == "fitted"
+
+
+def test_run_pipeline_with_a_composite_reference(tmp_path):
+    """Scenes normalized against a composite (median bands, one 8-band-only
+    band empty as in a pre-8-band composite) on the scenes' own grid."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    output_dir = tmp_path / "output"
+    size = 60
+    rng = np.random.default_rng(3)
+    ref = {b: rng.uniform(lo, hi, (size, size)) for b, (lo, hi) in
+           {"blue": (200, 3000), "green": (100, 1500), "red": (150, 2000), "nir": (300, 3500)}.items()}
+    composite_bands, descriptions = [], []
+    for name in ["coastal_blue", "blue", "green", "red", "nir"]:
+        for stat in ("median", "mean"):
+            arr = (ref[name] if name in ref else np.full((size, size), -9999.0)).astype(np.float32).copy()
+            if name in ref:
+                arr[:, :3] = -9999.0  # outside the composite's coverage
+            composite_bands.append(arr)
+            descriptions.append(f"{name}_{stat}")
+    composite = write_geotiff(str(tmp_path / "solstice_2020.tif"), composite_bands, band_descriptions=descriptions,
+                              nodata=-9999.0, dtype=gdal.GDT_Float32)
+    for scene_id, seed in (("20200601_120000_a", 1), ("20200602_120000_b", 2)):
+        noise = np.random.default_rng(seed)
+        _write_varying_scene(input_dir, scene_id, [
+            np.clip(ref[b] / 1.1 + noise.normal(0, 3, (size, size)), 1, None).astype(np.uint16)
+            for b in ("blue", "green", "red", "nir")
+        ])
+
+    result = pipeline.run_pipeline(
+        str(input_dir), str(output_dir), reference_composite=composite,
+        composite_cache_dir=str(tmp_path / "cache"),
+        use_omnicloudmask=False, use_water_mask=False, use_vegetation_mask=False,
+        min_overlap_pixels=100, min_fit_pixels=2, invariance_frequency_threshold=0.1, min_observations=1,
+        device="cpu", workers=None,
+    )
+    assert result.reference_scene_id == "solstice_2020"
+    assert result.band_names == ["blue", "green", "red", "nir"]  # coastal_blue has no data
+    assert {r.scene_id: r.status for r in result.scene_results} == {
+        "20200601_120000_a": "fitted", "20200602_120000_b": "fitted"}
+    model = model_io.load_model(pipeline._model_path(str(output_dir), "20200601_120000_a"))
+    for band in model.bands:
+        assert not band.identity_fallback
+        assert band.slope == pytest.approx(1.1, abs=0.01)
+    # Nothing is written for the composite itself; its masks are, with the
+    # composite's empty edge flagged as nodata.
+    assert not os.path.exists(pipeline._model_path(str(output_dir), "solstice_2020"))
+    flags = masking.load_flags_window(pipeline._flags_path(str(output_dir), "solstice_2020"), (0, 0, size, size))
+    assert (flags[:, :3] & masking.EXCLUDE_NODATA).all() and not flags[:, 3:].any()

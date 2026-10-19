@@ -211,6 +211,7 @@ def compute_exclusion_flags(
     lidar_slope_excluded: np.ndarray | None = None,
     lidar_rough_excluded: np.ndarray | None = None,
     lidar_shadow_excluded: np.ndarray | None = None,
+    block_rows: int = io.DEFAULT_BLOCK_ROWS,
 ) -> np.ndarray:
     """Bitmask (uint8) over the *entire* scene combining every exclusion
     source, each as its own bit (EXCLUDE_NODATA/WATER/UDM2/OMNICLOUD/
@@ -232,19 +233,12 @@ def compute_exclusion_flags(
     """
     info = io.get_raster_info(analytic_path)
     window = (0, 0, info.width, info.height)
-    flags = np.zeros((info.height, info.width), dtype=np.uint8)
-
-    flags |= (~read_nodata_valid_mask(analytic_path, window)).astype(np.uint8) * EXCLUDE_NODATA
-
-    if use_water_mask:
-        water = compute_ndwi_water_mask(analytic_path, window, band_names, ndwi_threshold=ndwi_threshold)
-        if water is not None:
-            flags |= water.astype(np.uint8) * EXCLUDE_WATER
-
-    if use_vegetation_mask:
-        vegetation = compute_ndvi_vegetation_mask(analytic_path, window, band_names, ndvi_threshold=ndvi_threshold)
-        if vegetation is not None:
-            flags |= vegetation.astype(np.uint8) * EXCLUDE_VEGETATION
+    # Nodata/water/vegetation in row blocks: a whole large 8-band scene
+    # read at once as float64 is several GB.
+    flags = _spectral_exclusion_flags(
+        analytic_path, band_names, use_water_mask=use_water_mask, ndwi_threshold=ndwi_threshold,
+        use_vegetation_mask=use_vegetation_mask, ndvi_threshold=ndvi_threshold, block_rows=block_rows,
+    )
 
     if udm2_path is not None:
         not_clear = ~read_udm2_valid_mask(udm2_path, window)
@@ -271,6 +265,71 @@ def compute_exclusion_flags(
     if lidar_shadow_excluded is not None:
         flags |= lidar_shadow_excluded.astype(np.uint8) * EXCLUDE_LIDAR_SHADOW
 
+    return flags
+
+
+def compute_composite_exclusion_flags(
+    analytic_path: str,
+    band_names: list[str],
+    *,
+    use_water_mask: bool = True,
+    ndwi_threshold: float = 0.0,
+    use_vegetation_mask: bool = True,
+    ndvi_threshold: float = 0.2,
+    block_rows: int = io.DEFAULT_BLOCK_ROWS,
+) -> np.ndarray:
+    """compute_exclusion_flags for a composite reference (see
+    composite_reference.ensure_reference_raster): nodata, water and
+    vegetation only. There is no UDM2 or OmniCloudMask pass: a composite
+    has no UDM2, and its per-pixel statistic over many dates has no clouds
+    of its own to find."""
+    return _spectral_exclusion_flags(
+        analytic_path, band_names, use_water_mask=use_water_mask, ndwi_threshold=ndwi_threshold,
+        use_vegetation_mask=use_vegetation_mask, ndvi_threshold=ndvi_threshold, block_rows=block_rows,
+    )
+
+
+def _spectral_exclusion_flags(
+    analytic_path: str,
+    band_names: list[str],
+    *,
+    use_water_mask: bool,
+    ndwi_threshold: float,
+    use_vegetation_mask: bool,
+    ndvi_threshold: float,
+    block_rows: int,
+) -> np.ndarray:
+    """The EXCLUDE_NODATA/WATER/VEGETATION bits of an exclusion bitmask,
+    read in row blocks of `block_rows`, so memory stays bounded by a block
+    whatever the raster's size. A pixel is nodata where any band equals the
+    nodata value or is non-finite; water and vegetation are as in
+    compute_ndwi_water_mask / compute_ndvi_vegetation_mask."""
+    info = io.get_raster_info(analytic_path)
+    flags = np.zeros((info.height, info.width), dtype=np.uint8)
+    ndwi = sensors.ndwi_band_indices(band_names) if use_water_mask else None
+    ndvi = sensors.ndvi_band_indices(band_names) if use_vegetation_mask else None
+    for name, wanted, indices in (("NDWI water", use_water_mask, ndwi), ("NDVI vegetation", use_vegetation_mask, ndvi)):
+        if wanted and indices is None:
+            warnings.warn(f"{name} mask skipped for '{analytic_path}': band set {band_names!r} lacks its bands.",
+                          RuntimeWarning)
+    for row_off, n_rows in io.iter_row_blocks(info.height, block_rows):
+        arr = io.read_window_bands(analytic_path, (0, row_off, info.width, n_rows))
+        invalid = ~np.isfinite(arr).all(axis=0)
+        if info.nodata is not None:
+            invalid |= (arr == info.nodata).any(axis=0)
+        block = invalid.astype(np.uint8) * EXCLUDE_NODATA
+        with np.errstate(invalid="ignore", divide="ignore"):
+            for indices, threshold, bit, sign in ((ndwi, ndwi_threshold, EXCLUDE_WATER, 1),
+                                                  (ndvi, ndvi_threshold, EXCLUDE_VEGETATION, -1)):
+                if indices is None:
+                    continue
+                # NDWI = (green - nir) / (green + nir); NDVI = (nir - red) / (nir + red).
+                # The sensors helpers' indices are 1-based.
+                a, nir = arr[indices[0] - 1], arr[indices[1] - 1]
+                denom = a + nir
+                index = np.where(denom != 0, sign * (a - nir) / denom, 0.0)
+                block |= (index > threshold).astype(np.uint8) * bit
+        flags[row_off:row_off + n_rows] = block
     return flags
 
 

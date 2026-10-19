@@ -491,6 +491,45 @@ output_folder/
   spectral_coverage_report.csv          per-scene, per-band invariant-target spectral coverage (see below)
 ```
 
+### Composite references (e.g. the solstice composites)
+
+`run_pipeline(..., reference_composite="…/solstice_2023.tif")` uses a
+multi-statistic composite (see `scripts/build_solstice_composite_reference.py`)
+as the reference instead of a scene:
+
+- The composite is read through its `composite_stat` bands (default
+  `median`), via the tiled single-statistic cache
+  (`composite_reference.ensure_single_stat_cache`; `composite_cache_dir`
+  puts it elsewhere) and a VRT over it in `output_folder/reference/`, whose
+  bands carry plain names (`red`, not `red_median`).
+- Only bands valid over at least `min_composite_band_coverage` (default 0.9)
+  of the area its best-covered band is valid over are used. The composites
+  built before 8-band data existed hold coastal_blue/green_i/yellow/rededge
+  as empty layers, so for those years only blue/green/red/nir are used.
+- The composite's masks (`masks/<composite>_flags.tif`, `_search_mask.tif`)
+  hold nodata, water, vegetation and any LiDAR exclusions. They are computed
+  in row blocks, because a whole-AOI composite is far larger than a scene.
+  There is no UDM2 or OmniCloudMask pass for the composite (targets still
+  get both).
+- Every scene is a target and nothing is written for the composite itself.
+  Scenes must be on the composite's pixel grid. The Philadelphia raw scenes,
+  their registered versions and the composites all are.
+
+`scripts/run_composite_reference_pipeline.py` does this across a whole
+archive. It assigns each scene to one composite, runs the pipeline once per
+composite into `<output>/<composite>/`, and writes the assignment to
+`composite_assignment.csv` (`--dry-run` stops after that):
+
+- Each scene uses the composite whose solstice is nearest its acquisition,
+  among the composites that hold every one of its bands
+  (`composite_reference.composite_is_eligible`). With `--composite-year`, it
+  uses that year's composite wherever it is eligible.
+- An 8-band scene also only uses a composite whose acquisition window
+  (solstice ± `--window-days`, default 14) starts on or after the onset of
+  8-band data. The onset defaults to the earliest 8-band scene found, or is
+  set with `--eight-band-onset`. That way all 8 bands of every 8-band scene
+  are corrected, against a composite built entirely from 8-band-era imagery.
+
 ## Spectral coverage report
 
 `spectral_coverage_report.csv` (one row per scene per band, for the
@@ -625,7 +664,8 @@ module docstring for usage and the exact metrics it reports.
 | `sensors.py` | band-name detection (Dove-C/R, SuperDove 4b/8b, ...) |
 | `io.py` | scene discovery, raster metadata, grid alignment/overlap, chunked reads/writes |
 | `backend.py` | GPU/CPU array-backend selection (NumPy/CuPy) — see "GPU support" above |
-| `masking.py` | per-scene exclusion bitmask: nodata + NDWI water + UDM2 + OmniCloudMask |
+| `masking.py` | per-scene exclusion bitmask: nodata + NDWI water + UDM2 + OmniCloudMask (and the row-blocked composite-reference variant) |
+| `composite_reference.py` | composites as references: single-statistic cache, band coverage, per-scene composite choice (8-band onset rule) |
 | `registration.py` | grid-alignment check (implemented) + co-registration (**stub**, see below) |
 | `irmad.py` | IR-MAD: weighted covariance, canonical correlation, chi-square weighting |
 | `normalize.py` | Phase A candidate detection + Phase C regression-from-consensus-mask |
