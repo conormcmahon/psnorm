@@ -68,10 +68,14 @@ def build_preferred_imagery(
     "registration_<status>" for a registration that did not complete and
     "registered_file_missing" for an accepted one whose output is not on
     disk -- a run that only saves accepted scenes never writes the rest)."""
-    manifest = _read_rows(os.path.join(output_dir, "registration_manifest.csv"), "scene_id")
+    # Keyed by raw file name, not scene_id: a 4-band and an 8-band product
+    # of the same capture share a scene_id.
+    manifest = {os.path.basename(row["analytic_path"]): row
+                for row in _read_rows(os.path.join(output_dir, "registration_manifest.csv"), "analytic_path").values()}
     metrics = _read_metrics(output_dir)
     rows = []
-    for scene_id, entry in manifest.items():
+    for entry in manifest.values():
+        scene_id = entry["scene_id"]
         raw_path = entry["analytic_path"]
         registered_path = entry.get("output_path") or ""
         band_names = sensors.BAND_PROFILES.get(int(entry["band_count"]), []) if entry.get("band_count") else []

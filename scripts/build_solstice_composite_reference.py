@@ -40,9 +40,9 @@ Pipeline:
      solstice's turn-of-year wraparound (scenes acquired in early January
      belonging to the *previous* year's December solstice) without
      special-casing it, while still keeping each year's composite
-     separate. In this archive the two products don't overlap in time,
-     so any given year's composite will in practice draw from only one
-     of them, but the pooling logic is general.
+     separate. Where the two products overlap in time, a year's composite
+     draws from both; run scripts/remove_duplicate_scenes.py first, so a
+     capture delivered as both products is not counted twice.
   5. Each year's output always estimates all 8 canonical bands
      (coastal_blue, blue, green_i, green, yellow, red, rededge, nir), even
      though only the 4-band product's 4 common bands (blue, green, red,

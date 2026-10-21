@@ -530,6 +530,25 @@ composite into `<output>/<composite>/`, and writes the assignment to
   set with `--eight-band-onset`. That way all 8 bands of every 8-band scene
   are corrected, against a composite built entirely from 8-band-era imagery.
 
+### Adding scenes to the raw archive
+
+psnorm assumes one file per scene ID. Over the period the 4-band and 8-band
+products overlap, the same capture can be delivered as both, so after copying
+new data in, run `scripts/remove_duplicate_scenes.py <raw root>`. It reports
+every scene ID found more than once and, with `--apply`, deletes the copy with
+fewer bands, provided all of its bands are in the copy kept. Pass the
+registration output directories with `--registered-dir` (repeatable) to remove
+the deleted copy's registered raster and its manifest, alignment metrics and
+preferred-imagery rows too. Removed files are logged to
+`<raw root>/removed_duplicate_scenes.csv`.
+
+To register only the new scenes, rerun
+`scripts/register_to_solstice_composites.py` with the same output directories,
+plus `--task-cache <file> --refresh-task-cache`. Scenes already in the
+manifests are skipped, and the new rows are appended to the manifests and
+alignment metrics. `preferred_imagery.csv` is rewritten for every scene.
+`--dry-run` shows what would run.
+
 ## Spectral coverage report
 
 `spectral_coverage_report.csv` (one row per scene per band, for the

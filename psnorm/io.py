@@ -11,7 +11,6 @@ they overlap.
 
 from __future__ import annotations
 
-import glob
 import json
 import os
 import re
@@ -121,6 +120,38 @@ def _as_suffixes(analytic_suffix: str | tuple[str, ...]) -> tuple[str, ...]:
     return (analytic_suffix,) if isinstance(analytic_suffix, str) else tuple(analytic_suffix)
 
 
+ORDER_MANIFEST = "manifest.json"
+
+
+def list_folder(folder: str) -> list[str]:
+    """The names in `folder`: its directory listing, plus every file named
+    in a Planet order manifest (manifest.json) in it that exists there.
+
+    On the WSL/virtiofs mount the Philadelphia archive is read through,
+    listing a large folder silently leaves out a contiguous block of its
+    entries (consistently, across remounts), while every file can still
+    be opened by name. A delivered folder's manifest.json names each file
+    in it, and each one it names is checked with a direct lookup, which
+    that failure does not affect."""
+    names = set(os.listdir(folder))
+    manifest = os.path.join(folder, ORDER_MANIFEST)
+    if os.path.isfile(manifest):
+        try:
+            with open(manifest) as f:
+                listed = [os.path.basename(entry["path"]) for entry in json.load(f).get("files", [])]
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            listed = []
+        names.update(n for n in listed if n not in names and os.path.exists(os.path.join(folder, n)))
+    return sorted(names)
+
+
+def walk_folders(folder: str, recursive: bool = False) -> list[str]:
+    """`folder`, plus (with `recursive`) every folder under it."""
+    if not recursive:
+        return [folder]
+    return [d for d, _, _ in os.walk(folder)]
+
+
 def discover_scenes(
     folder: str,
     *,
@@ -142,15 +173,18 @@ def discover_scenes(
     per-scene output is named by scene ID.
 
     Skips macOS AppleDouble resource-fork files (`._*`), which are not valid
-    rasters but otherwise match the same glob pattern.
+    rasters but otherwise match the same glob pattern. Folders are read with
+    `list_folder`, so files a broken directory listing leaves out are still
+    found where an order manifest names them.
     """
     found = []  # (scene_id, analytic_path)
-    for suffix in _as_suffixes(analytic_suffix):
-        pattern = os.path.join(folder, "**", f"*{suffix}") if recursive else os.path.join(folder, f"*{suffix}")
-        for p in glob.glob(pattern, recursive=recursive):
-            base = os.path.basename(p)
-            if not base.startswith("._"):
-                found.append((base[: -len(suffix)], p))
+    for d in walk_folders(folder, recursive):
+        for base in list_folder(d):
+            if base.startswith("._"):
+                continue
+            for suffix in _as_suffixes(analytic_suffix):
+                if base.endswith(suffix):
+                    found.append((base[: -len(suffix)], os.path.join(d, base)))
     found.sort()
     seen: dict[str, str] = {}
     for scene_id, path in found:

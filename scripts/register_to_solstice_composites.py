@@ -52,7 +52,12 @@ Outputs, under --output-dir:
   run_params_history.jsonl  the same for every start
 
 Resumable: scenes already in a model's manifest are skipped for that model
-(pass --retry-failed to re-run the ones that failed).
+(pass --retry-failed to re-run the ones that failed). Scenes are told apart
+by raw file name, since a 4-band and an 8-band product of the same capture
+share a scene_id. Scenes added to the raw archive later are picked up with
+--task-cache ... --refresh-task-cache (only the new scenes run; their rows
+are appended to the manifests and alignment metrics, and
+preferred_imagery.csv is rewritten for every scene).
 
 Parallelism is memory-aware: a scene starts only while the estimated
 memory of everything running fits --memory-budget-gb (a scene too big for
@@ -164,14 +169,37 @@ def nearest_composite(acquired: datetime, composites):
     return year, (acquired - solstice) / timedelta(days=1), path
 
 
-def build_tasks(raw_root, output_dir, composites, products):
+def build_tasks(raw_root, output_dir, composites, products, *, cached=None, min_file_age_s=0.0):
+    """One task per scene under raw_root. `cached` ({analytic_path: task},
+    e.g. from --task-cache) is reused as-is, so only scenes not in it have
+    their headers read. Scenes whose analytic or UDM2 file was modified or
+    created (copied in) in the last `min_file_age_s` seconds are left out,
+    to be picked up by a later run."""
+    cached = cached or {}
     tasks = []
+    now = time.time()
+    n_reused = n_recent = 0
     for product in products:
         for scene in compositing.discover_product_scenes(raw_root, product, PRODUCTS[product], UDM2_SUFFIX):
+            if scene.analytic_path in cached:
+                tasks.append(cached[scene.analytic_path])
+                n_reused += 1
+                continue
             if scene.acquired is None:
                 print(f"  WARNING: no acquisition time in '{scene.scene_id}'; skipping", flush=True)
                 continue
-            info = io.get_raster_info(scene.analytic_path)
+            files = [p for p in (scene.analytic_path, scene.udm2_path) if p]
+            # ctime as well as mtime: a copy that preserves the source's
+            # modification time (as this archive's do) only updates ctime.
+            if min_file_age_s and any(now - max(os.stat(p).st_mtime, os.stat(p).st_ctime) < min_file_age_s
+                                      for p in files):
+                n_recent += 1
+                continue
+            try:
+                info = io.get_raster_info(scene.analytic_path)
+            except Exception as exc:  # e.g. a file still being copied in
+                print(f"  WARNING: cannot read '{scene.analytic_path}' ({exc}); skipping", flush=True)
+                continue
             year, days, ref_path = nearest_composite(scene.acquired, composites)
             period = os.path.basename(os.path.dirname(scene.analytic_path))
             tasks.append({
@@ -184,6 +212,9 @@ def build_tasks(raw_root, output_dir, composites, products):
                 "megapixels": info.width * info.height / 1e6,
                 "input_bytes": os.path.getsize(scene.analytic_path),
             })
+    if cached or n_recent:
+        print(f"  {n_reused} scene(s) from the task cache, {len(tasks) - n_reused} new; "
+              f"{n_recent} left out as modified within the last {min_file_age_s / 60:g} min", flush=True)
     tasks.sort(key=lambda t: t["acquired"])
     return tasks
 
@@ -354,10 +385,13 @@ class Recorder:
             writer.writerows(rows)
 
     def previously_recorded(self) -> dict[str, str]:
+        """{raw analytic file name: status}. Keyed by file name, not
+        scene_id: one capture can be in the archive as both a 4-band and an
+        8-band product, with the same scene_id."""
         if not os.path.exists(self.manifest_path):
             return {}
         with open(self.manifest_path, newline="") as f:
-            return {r["scene_id"]: r["status"] for r in csv.DictReader(f)}
+            return {os.path.basename(r["analytic_path"]): r["status"] for r in csv.DictReader(f)}
 
     def record(self, row: dict, library_metrics: dict | None, peak_rss_gb) -> None:
         """Append one scene's row for this recorder's warp model.
@@ -686,7 +720,17 @@ def main():
                              'e.g. {"workers": 3, "memory_budget_gb": 6}')
     parser.add_argument("--task-cache", default=None,
                         help="JSON file caching the discovered scene list (discovery reads every scene's header, "
-                             "minutes on a slow mount); delete it if the raw archive or composites change")
+                             "minutes on a slow mount); see --refresh-task-cache if scenes are added to the raw "
+                             "archive, and delete it if the composites change")
+    parser.add_argument("--refresh-task-cache", action="store_true",
+                        help="rediscover the raw archive, reusing --task-cache's entries and reading headers only "
+                             "for scenes not in it, and save the result back (for scenes added since it was made)")
+    parser.add_argument("--min-file-age-minutes", type=float, default=0.0,
+                        help="when discovering, leave out scenes whose files were modified or copied in this recently "
+                             "(possibly still being copied); a later --refresh-task-cache run picks them up")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="discover scenes and report what would run, then stop (writes nothing, not even "
+                             "the task cache)")
     parser.add_argument("--limit", type=int, default=None, help="only the first N pending scenes (for testing)")
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--require-rewritten-composites", action="store_true",
@@ -726,6 +770,8 @@ def main():
         parser.error("each warp model needs its own output directory")
 
     for model, output_dir in output_dirs.items():
+        if args.dry_run:
+            break
         os.makedirs(output_dir, exist_ok=True)
         run_record = {"registration_params": asdict(replace(params, warp_model=model)),
                       "acceptance": asdict(acceptance), "save_registered": args.save_registered, "argv": sys.argv,
@@ -740,18 +786,23 @@ def main():
 
     composites = find_composites(args.composite_dir, args.hemisphere)
     print(f"Composites: {', '.join(str(y) for y, _, _ in composites)}", flush=True)
+    cached = None
     if args.task_cache and os.path.exists(args.task_cache):
         with open(args.task_cache) as f:
-            tasks = json.load(f)
-        # Cached entries are independent of the output directory.
-        for t in tasks:
-            t["output_path"] = os.path.join(args.output_dir, t["output_relpath"])
-        print(f"Loaded {len(tasks)} scenes from task cache {args.task_cache}", flush=True)
+            cached = json.load(f)
+        print(f"Loaded {len(cached)} scenes from task cache {args.task_cache}", flush=True)
+    if cached is not None and not args.refresh_task_cache:
+        tasks = cached
     else:
-        tasks = build_tasks(args.raw_root, args.output_dir, composites, args.products.split(","))
-        if args.task_cache:
+        tasks = build_tasks(args.raw_root, args.output_dir, composites, args.products.split(","),
+                            cached={t["analytic_path"]: t for t in cached or []},
+                            min_file_age_s=args.min_file_age_minutes * 60)
+        if args.task_cache and not args.dry_run:
             with open(args.task_cache, "w") as f:
                 json.dump(tasks, f)
+    # Cached entries are independent of the output directory.
+    for t in tasks:
+        t["output_path"] = os.path.join(args.output_dir, t["output_relpath"])
 
     recorders = {model: Recorder(output_dir) for model, output_dir in output_dirs.items()}
     recorded = {model: recorder.previously_recorded() for model, recorder in recorders.items()}
@@ -761,8 +812,8 @@ def main():
     for t in tasks:
         missing = [
             model for model in output_dirs
-            if recorded[model].get(t["scene_id"]) is None
-            or (args.retry_failed and recorded[model][t["scene_id"]] != "ok")
+            if recorded[model].get(os.path.basename(t["analytic_path"])) is None
+            or (args.retry_failed and recorded[model][os.path.basename(t["analytic_path"])] != "ok")
         ]
         if missing:
             pending.append({**t, "acceptance": asdict(acceptance), "staging_dir": staging_dir, "warp_outputs": {
@@ -778,6 +829,16 @@ def main():
     print(f"{len(tasks)} scenes found; {len(tasks) - n_unrecorded} already recorded for every model; "
           f"{len(pending)} to run ({', '.join(f'{n} for {k}' for k, n in by_models.items()) or 'none'})"
           f"{' (--limit)' if len(pending) < n_unrecorded else ''}. Params: {params}", flush=True)
+
+    if args.dry_run:
+        counts = {}
+        for t in pending:
+            key = (t["product"], t["reference_year"])
+            counts[key] = counts.get(key, 0) + 1
+        for (product, year), n in sorted(counts.items()):
+            print(f"  {product} -> solstice_{year}: {n}", flush=True)
+        print("Dry run: nothing registered or written.", flush=True)
+        return
 
     progress = Progress(pending, args.progress_interval_s)
     run(pending, params, recorders, progress, args.workers, args.memory_budget_gb, args.base_gb, args.gb_per_mpx,

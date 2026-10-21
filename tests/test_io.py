@@ -263,3 +263,24 @@ def test_discover_scenes_rejects_a_scene_id_found_twice(tmp_path):
         write_geotiff(str(tmp_path / sub / "20210105_150000_1003_3B_AnalyticMS_SR_harmonized_clip.tif"), [arr])
     with pytest.raises(ValueError, match="found twice"):
         io.discover_scenes(str(tmp_path), recursive=True)
+
+
+def test_list_folder_adds_existing_files_named_in_the_order_manifest(tmp_path, monkeypatch):
+    import json as _json
+    import os as _os
+
+    from psnorm import io as _io
+
+    for name in ("a_3B_AnalyticMS_SR_harmonized_clip.tif", "b_3B_AnalyticMS_SR_harmonized_clip.tif"):
+        (tmp_path / name).write_text("x")
+    (tmp_path / "manifest.json").write_text(_json.dumps({"files": [
+        {"path": "PSScene/a_3B_AnalyticMS_SR_harmonized_clip.tif"},
+        {"path": "PSScene/b_3B_AnalyticMS_SR_harmonized_clip.tif"},
+        {"path": "PSScene/gone_3B_AnalyticMS_SR_harmonized_clip.tif"}]}))
+    real_listdir = _os.listdir
+    # A listing that leaves out "b" (as the WSL mount's does for a block of entries).
+    monkeypatch.setattr(_io.os, "listdir", lambda d: [n for n in real_listdir(d) if not n.startswith("b_")])
+
+    assert _io.list_folder(str(tmp_path)) == [
+        "a_3B_AnalyticMS_SR_harmonized_clip.tif", "b_3B_AnalyticMS_SR_harmonized_clip.tif", "manifest.json"]
+    assert [s.scene_id for s in _io.discover_scenes(str(tmp_path))] == ["a", "b"]

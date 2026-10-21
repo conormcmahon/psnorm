@@ -102,7 +102,7 @@ def test_record_outcome_writes_each_model_to_its_own_directory(monkeypatch, tmp_
             rows = list(csv.DictReader(f))
         assert len(rows) == 1 and rows[0]["warp_model"] == model and rows[0]["status"] == "ok"
         assert float(rows[0]["affine_shift_x_px"]) == 0.25
-        assert recorders[model].previously_recorded() == {"20240101_120000_abcd": "ok"}
+        assert recorders[model].previously_recorded() == {"20240101_120000_abcd_3B_AnalyticMS_SR_harmonized_clip.tif": "ok"}
         metrics_csv = tmp_path / model / "alignment_metrics" / "registration_metrics_4band.csv"
         header, line = metrics_csv.read_text().splitlines()
         assert "affine_m00" in header.split(",") and len(header.split(",")) == len(line.split(","))
@@ -192,3 +192,61 @@ def test_preferred_imagery_lists_accepted_scenes_as_registered(monkeypatch, tmp_
     assert [s.udm2_path for s in swapped] == [s.udm2_path for s in scenes]
     # Applying twice changes nothing more.
     assert preferred_imagery.apply_preferred_imagery(swapped, path) == swapped
+
+
+def test_build_tasks_reuses_cached_scenes_and_leaves_out_ones_still_being_copied(monkeypatch, tmp_path):
+    from datetime import datetime
+
+    from psnorm import io
+
+    folder = tmp_path / "philadelphia4b" / "philadelphia4b_2021_244_273"
+    folder.mkdir(parents=True)
+    paths = {}
+    for name in ("old", "new", "copying"):
+        paths[name] = str(folder / f"{name}.tif")
+        open(paths[name], "w").close()
+    # An hour on: "copying" was written just now (its mtime; the others' ctime is an hour old).
+    later = os.path.getmtime(paths["copying"]) + 3600
+    monkeypatch.setattr(batch.time, "time", lambda: later)
+    os.utime(paths["copying"], (later, later))
+    scenes = [io.Scene(scene_id=n, analytic_path=p, udm2_path=None, metadata_path=None,
+                       acquired=datetime(2021, 9, 10)) for n, p in paths.items()]
+    monkeypatch.setattr(batch.compositing, "discover_product_scenes",
+                        lambda root, product, *a, **k: scenes if product == "philadelphia4b" else [])
+    headers_read = []
+
+    def raster_info(path):
+        headers_read.append(path)
+        return SimpleNamespace(width=10, height=20, band_count=4)
+
+    monkeypatch.setattr(batch.io, "get_raster_info", raster_info)
+    composites = [(2021, datetime(2021, 6, 21), "solstice_2021.tif")]
+    cached = {paths["old"]: {"scene_id": "old", "analytic_path": paths["old"], "acquired": "2021-09-10T00:00:00"}}
+
+    tasks = batch.build_tasks(str(tmp_path), str(tmp_path / "out"), composites, ["philadelphia4b", "philadelphia8b"],
+                              cached=cached, min_file_age_s=600)
+
+    assert [t["scene_id"] for t in tasks] == ["old", "new"]
+    assert tasks[0] is cached[paths["old"]]
+    assert headers_read == [paths["new"]]
+    assert tasks[1]["reference_year"] == 2021 and tasks[1]["megapixels"] == 200 / 1e6
+
+
+def test_a_4band_and_an_8band_product_of_one_capture_are_kept_apart(tmp_path):
+    out_dir = tmp_path / "affine"
+    recorder = batch.Recorder(str(out_dir))
+    scene_id = "20200502_150055_00_2271"
+    raws = {4: f"/raw/philadelphia4b/p/{scene_id}_3B_AnalyticMS_SR_harmonized_clip.tif",
+            8: f"/raw/philadelphia8b/p/{scene_id}_3B_AnalyticMS_SR_8b_harmonized_clip.tif"}
+    with open(recorder.manifest_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=batch.MANIFEST_FIELDS)
+        writer.writeheader()
+        for n, raw in raws.items():
+            writer.writerow({"scene_id": scene_id, "product": f"philadelphia{n}b", "analytic_path": raw,
+                             "status": "insufficient_pixels", "band_count": n})
+
+    assert recorder.previously_recorded() == {os.path.basename(raws[4]): "insufficient_pixels",
+                                              os.path.basename(raws[8]): "insufficient_pixels"}
+    rows = preferred_imagery.build_preferred_imagery(str(out_dir))
+    assert sorted(r["raw_analytic_path"] for r in rows) == sorted(raws.values())
+    assert {r["scene_id"] for r in rows} == {scene_id}
