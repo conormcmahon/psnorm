@@ -19,6 +19,7 @@ import csv
 import math
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Literal
@@ -1143,7 +1144,7 @@ def _fork_context():
     return mp.get_context("spawn")
 
 
-def _map_parallel(fn, items, workers, *extra_args, on_result=None):
+def _map_parallel(fn, items, workers, *extra_args, on_result=None, retries=None, log=print):
     """[fn(item, *extra_args) for item in items], parallelized across
     `workers` processes. The returned list is always in the same order as
     `items`, regardless of completion order.
@@ -1158,26 +1159,82 @@ def _map_parallel(fn, items, workers, *extra_args, on_result=None):
     "starting" and "done" -- which reads identically to a hang. Passing
     `on_result` (used by run_pipeline's Phase A/C batches) lets the caller
     log/count as items complete instead of only once, at the very end.
+
+    An item whose call raises -- or that was running or queued when a
+    worker process died (BrokenProcessPool, e.g. a worker that failed to
+    import a module) -- is retried, in a fresh pool, up to `retries` more
+    times once everything else has finished; only then is its last error
+    raised. This is for transient I/O faults: on the virtiofs mounts this
+    runs on, a file can intermittently fail to open with "Bad file
+    descriptor" until the kernel's caches are dropped, and one such read
+    used to fail a whole multi-hour batch. Before each retry round the
+    shell command in the environment variable PSNORM_IO_RECOVERY_CMD (if
+    set; e.g. "sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches") is
+    run, then RETRY_DELAY_S is waited. Every item function used here
+    writes its outputs from scratch, so rerunning one is safe.
     """
+    if retries is None:
+        retries = MAP_RETRIES
     n_workers = _resolve_workers(workers)
-    if n_workers is None or n_workers <= 1 or len(items) <= 1:
-        results = []
-        for item in items:
-            r = fn(item, *extra_args)
-            if on_result is not None:
-                on_result(item, r)
-            results.append(r)
-        return results
-    ctx = _fork_context()
     results = [None] * len(items)
-    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
-        futures = {executor.submit(fn, item, *extra_args): i for i, item in enumerate(items)}
-        for future in as_completed(futures):
-            i = futures[future]
-            results[i] = future.result()
-            if on_result is not None:
-                on_result(items[i], results[i])
-    return results
+    pending = list(range(len(items)))
+    errors = {}
+    for attempt in range(retries + 1):
+        if attempt:
+            log(f"  retrying {len(pending)} item(s) after error(s) (attempt {attempt + 1}/{retries + 1}); "
+                f"last error: {next(iter(errors.values()))!r}")
+            _recover_from_io_error(log)
+        errors = {}
+        if n_workers is None or n_workers <= 1 or len(pending) <= 1:
+            for i in pending:
+                try:
+                    results[i] = fn(items[i], *extra_args)
+                except Exception as exc:
+                    errors[i] = exc
+                    continue
+                if on_result is not None:
+                    on_result(items[i], results[i])
+        else:
+            finished = set()
+            try:
+                with ProcessPoolExecutor(max_workers=n_workers, mp_context=_fork_context()) as executor:
+                    futures = {executor.submit(fn, items[i], *extra_args): i for i in pending}
+                    for future in as_completed(futures):
+                        i = futures[future]
+                        try:
+                            results[i] = future.result()
+                        except Exception as exc:
+                            errors[i] = exc
+                            continue
+                        finished.add(i)
+                        if on_result is not None:
+                            on_result(items[i], results[i])
+            except BrokenProcessPool as exc:
+                # The pool broke outside any one future (e.g. while
+                # starting up): every item without a result is retried.
+                errors.update({i: exc for i in pending if i not in finished and i not in errors})
+        pending = sorted(errors)
+        if not pending:
+            return results
+    raise errors[pending[0]]
+
+
+MAP_RETRIES = 2
+RETRY_DELAY_S = 30
+
+
+def _recover_from_io_error(log=print):
+    """Run PSNORM_IO_RECOVERY_CMD (if set), then wait RETRY_DELAY_S; see
+    _map_parallel."""
+    import subprocess
+    import time
+
+    command = os.environ.get("PSNORM_IO_RECOVERY_CMD")
+    if command:
+        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+        if result.returncode != 0:
+            log(f"  PSNORM_IO_RECOVERY_CMD failed ({result.returncode}): {result.stderr.strip()[-200:]}")
+    time.sleep(RETRY_DELAY_S)
 
 
 # --------------------------------------------------------------------------
@@ -1291,8 +1348,8 @@ def run_pipeline(
     omnicloud_kwargs: dict | None = None,
     max_iter: int = 30,
     conv_threshold: float = 0.99,
-    ncp_threshold: float = 0.70,
-    invariance_frequency_threshold: float = 0.5,
+    ncp_threshold: float = normalize.DEFAULT_NCP_THRESHOLD,
+    invariance_frequency_threshold: float = normalize.DEFAULT_INVARIANCE_FREQUENCY_THRESHOLD,
     min_observations: int = 2,
     min_overlap_pixels: int = 500,
     resume: Literal["no", "yes", "validate"] = "validate",
@@ -1507,7 +1564,7 @@ def run_pipeline(
             + (f" ({outcome.message})" if outcome.message else ""))
 
     candidate_outcomes = _map_parallel(
-        _detect_candidates_for_scene, targets, workers, config, on_result=_log_candidate_progress,
+        _detect_candidates_for_scene, targets, workers, config, on_result=_log_candidate_progress, log=log,
     )
 
     detected = [(s, o) for s, o in zip(targets, candidate_outcomes) if o.status == "detected"]
@@ -1547,7 +1604,7 @@ def run_pipeline(
         log(f"  [{n_done_c[0]}/{len(detected)}] {pair[0].scene_id}: {result.status}"
             + (f" ({result.message})" if result.message else ""))
 
-    target_results = _map_parallel(_finalize_pair, detected, workers, config, on_result=_log_finalize_progress)
+    target_results = _map_parallel(_finalize_pair, detected, workers, config, on_result=_log_finalize_progress, log=log)
 
     skipped_results = [
         SceneResult(scene.scene_id, outcome.status, message=outcome.message)

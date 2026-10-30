@@ -19,6 +19,17 @@ from scipy import stats
 
 from . import backend, io, irmad, masking
 
+# Invariant-target selection defaults (see README, "How invariant targets are
+# selected"). Phase A flags a pixel as a candidate where IR-MAD's no-change
+# probability exceeds DEFAULT_NCP_THRESHOLD; Phase B keeps it where it was a
+# candidate in more than DEFAULT_INVARIANCE_FREQUENCY_THRESHOLD of the
+# comparisons that evaluated it. Lowered from 0.70 / 0.5 in Oct 2026: against
+# the Philadelphia solstice composites those kept 63 consensus pixels for
+# 2018, and 0.4 / 0.3 kept 235,071 (enough for ~94% of scenes to reach
+# min_fit_pixels).
+DEFAULT_NCP_THRESHOLD = 0.4
+DEFAULT_INVARIANCE_FREQUENCY_THRESHOLD = 0.3
+
 
 def select_invariant_pixels(chisqr: np.ndarray, dof: int, ncp_threshold: float) -> np.ndarray:
     """Boolean mask of pixels whose no-change probability (under the
@@ -208,7 +219,7 @@ def detect_invariant_candidates(
     *,
     max_iter: int = 30,
     conv_threshold: float = 0.99,
-    ncp_threshold: float = 0.70,
+    ncp_threshold: float = DEFAULT_NCP_THRESHOLD,
     block_rows: int = io.DEFAULT_BLOCK_ROWS,
     downsample_factor: int = 1,
     log_transform: bool = True,

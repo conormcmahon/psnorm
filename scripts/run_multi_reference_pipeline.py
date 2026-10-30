@@ -24,7 +24,7 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from psnorm import io as pio
-from psnorm import pipeline, preferred_imagery, registration
+from psnorm import normalize, pipeline, preferred_imagery, registration
 
 MAX_ATTEMPTS = 150
 RETRY_DELAY_S = 20.0
@@ -66,8 +66,9 @@ def add_pipeline_arguments(parser):
     parser.add_argument("--workers", default="cpu")
     parser.add_argument("--resume", default="validate", choices=["no", "yes", "validate"])
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"])
-    parser.add_argument("--ncp-threshold", type=float, default=0.70)
-    parser.add_argument("--invariance-frequency-threshold", type=float, default=0.5)
+    parser.add_argument("--ncp-threshold", type=float, default=normalize.DEFAULT_NCP_THRESHOLD)
+    parser.add_argument("--invariance-frequency-threshold", type=float,
+                        default=normalize.DEFAULT_INVARIANCE_FREQUENCY_THRESHOLD)
     parser.add_argument("--dsm-path", default=None)
     parser.add_argument("--dsm-height-units", default="m", choices=["m", "ft"])
     parser.add_argument("--max-slope-deg", type=float, default=5.0)

@@ -33,11 +33,25 @@ more of that bin's points, rather than every group contributing an equal
 share regardless of its own distribution. An extra 'run_dir' field on each
 point records which group it came from.
 
+With --values-output (one --run-dir from
+scripts/run_composite_reference_pipeline.py, e.g. .../solstice_2019), the
+points are then sampled against every scene assigned to that composite with
+scripts/sample_tree_points.py, writing the same columns as its tree samples
+(tree_point_samples_all_time_v2.csv: raw/affine/TPS reflectance, the
+selected version, UDM2 clear flag, registration metrics and the scene's
+normalization fit), with point_id, class and frequency in place of treeid.
+
 Usage:
     .venv/bin/python scripts/generate_consensus_sample_points.py \\
         --run-dir /path/to/psnorm_output \\
         --output /path/to/consensus_sample_points.gpkg \\
         --n-bins 20 --per-bin 100 --seed 0
+
+    # stratified samples for one composite year, with every scene's values
+    .venv/bin/python scripts/generate_consensus_sample_points.py \\
+        --run-dir /mnt/e/.../invariant_targets_composite_reference/solstice_2019 \\
+        --output /path/to/consensus_points_2019.gpkg \\
+        --values-output /path/to/consensus_point_samples_2019.csv --workers 4
 
     # multi-reference: pool candidates across every reference group
     .venv/bin/python scripts/generate_consensus_sample_points.py \\
@@ -53,8 +67,11 @@ import sys
 
 import numpy as np
 from osgeo import gdal, ogr, osr
+from rasterio.crs import CRS
+from rasterio.warp import transform
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from psnorm import io
 
@@ -108,15 +125,6 @@ def generate_points(
     bin_indices = np.digitize(freq_values, edges[1:-1], right=False)
 
     rng = np.random.default_rng(seed)
-    dst = osr.SpatialReference()
-    dst.ImportFromEPSG(4326)
-    dst.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-    transforms: dict[str, osr.CoordinateTransformation] = {}
-    for label, info in infos.items():
-        src = osr.SpatialReference()
-        src.ImportFromWkt(info.crs)
-        src.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-        transforms[label] = osr.CoordinateTransformation(src, dst)
 
     selected = []
     for b in range(n_bins):
@@ -138,7 +146,8 @@ def generate_points(
             # itself derived this way lands back on the same pixel).
             x = gt[0] + (col + 0.5) * gt[1]
             y = gt[3] + (row + 0.5) * gt[5]
-            lon, lat, _ = transforms[group].TransformPoint(x, y)
+            # rasterio's own PROJ data: this environment's GDAL lacks it.
+            (lon,), (lat,) = transform(CRS.from_wkt(infos[group].crs), CRS.from_epsg(4326), [x], [y])
             selected.append({
                 "class": label_name,
                 "frequency": float(freq_values[idx]),
@@ -157,12 +166,18 @@ def generate_points(
     srs = osr.SpatialReference()
     srs.ImportFromEPSG(4326)
     layer = ds.CreateLayer("points", srs=srs, geom_type=ogr.wkbPoint)
+    layer.CreateField(ogr.FieldDefn("point_id", ogr.OFTInteger))
+    layer.CreateField(ogr.FieldDefn("lon", ogr.OFTReal))
+    layer.CreateField(ogr.FieldDefn("lat", ogr.OFTReal))
     layer.CreateField(ogr.FieldDefn("class", ogr.OFTString))
     layer.CreateField(ogr.FieldDefn("frequency", ogr.OFTReal))
     layer.CreateField(ogr.FieldDefn("run_dir", ogr.OFTString))
 
-    for p in selected:
+    for point_id, p in enumerate(selected, start=1):
         feat = ogr.Feature(layer.GetLayerDefn())
+        feat.SetField("point_id", point_id)
+        feat.SetField("lon", p["lon"])
+        feat.SetField("lat", p["lat"])
         feat.SetField("class", p["class"])
         feat.SetField("frequency", p["frequency"])
         feat.SetField("run_dir", p["run_dir"])
@@ -180,13 +195,37 @@ def generate_points(
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--run-dir", required=True, help="a psnorm_output directory (must contain consensus/)")
+    parser.add_argument("--run-dir", required=True, nargs="+",
+                        help="psnorm_output director(ies) (each must contain consensus/)")
     parser.add_argument("--output", required=True)
     parser.add_argument("--n-bins", type=int, default=20)
     parser.add_argument("--per-bin", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--values-output", default=None,
+                        help="also sample the points against every scene of the (single) --run-dir's composite "
+                             "group and write the values here (see the module docstring)")
+    parser.add_argument("--composite", default=None,
+                        help="for --values-output: the composite whose assigned scenes are sampled, where the "
+                             "--run-dir is not named after it (e.g. solstice_2023 for .../solstice_2023_vs_2024)")
+    parser.add_argument("--workers", type=int, default=1, help="processes for --values-output")
+    parser.add_argument("--tmp-dir", default=None, help="working directory for --values-output's CSV")
     args = parser.parse_args()
+    if args.values_output and len(args.run_dir) != 1:
+        parser.error("--values-output needs exactly one --run-dir (one composite's group)")
     generate_points(args.run_dir, args.output, n_bins=args.n_bins, per_bin=args.per_bin, seed=args.seed)
+    if args.values_output:
+        import sample_tree_points
+
+        run_dir = os.path.normpath(args.run_dir[0])
+        folder = os.path.basename(run_dir)
+        composite = args.composite or folder
+        sample_tree_points.main([
+            "--points", args.output, "--id-field", "point_id", "--extra-fields", "class,frequency",
+            "--normalization-dir", os.path.dirname(run_dir), "--composite", composite,
+            *(["--group-dir", f"{composite}={folder}"] if composite != folder else []),
+            "--workers", str(args.workers), "--output", args.values_output,
+            *(["--tmp-dir", args.tmp_dir] if args.tmp_dir else []),
+        ])
 
 
 if __name__ == "__main__":

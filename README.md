@@ -46,7 +46,7 @@ alongside the final gain/offset.
    restricted to pixels that pass that pair's search mask (nodata, water,
    vegetation, UDM2, and OmniCloudMask excluded — see Masking below).
    Pixels whose no-change probability exceeds `ncp_threshold` (default
-   0.70 — user-facing parameter) are flagged as invariant *candidates* for
+   0.4, `normalize.DEFAULT_NCP_THRESHOLD` — user-facing parameter) are flagged as invariant *candidates* for
    that pair and saved as a boolean raster
    (`candidates/{target_id}_candidate.tif`); nothing is regressed yet.
    `ncp_threshold` is deliberately more lenient than the "obvious" choice
@@ -70,7 +70,8 @@ alongside the final gain/offset.
    was *evaluated* (passed the search mask in both scenes) and how many of
    those times it was flagged invariant. A pixel only makes the final
    consensus set if `times_invariant / times_evaluated` exceeds
-   `invariance_frequency_threshold` (default 0.5, i.e. >50% — user-facing
+   `invariance_frequency_threshold` (default 0.3, i.e. >30%,
+   `normalize.DEFAULT_INVARIANCE_FREQUENCY_THRESHOLD` — user-facing
    parameter) **and** it was evaluated at least `min_observations` times (a
    floor so a pixel seen once can't reach 100% by chance). Masked
    comparisons never enter either count, so cloud/water exclusion in one
@@ -445,8 +446,8 @@ result = run_pipeline(
     use_vegetation_mask=True, ndvi_threshold=0.2,
     use_omnicloudmask=True,           # False to skip the OmniCloudMask pass
     use_log_transform=True,               # fit IR-MAD against log(DN); see "Log-transform" below
-    ncp_threshold=0.70,                   # per-pair "how invariant must a pixel be" cutoff
-    invariance_frequency_threshold=0.5,  # keep pixels invariant in >50% of evaluations
+    ncp_threshold=0.4,                    # per-pair "how invariant must a pixel be" cutoff
+    invariance_frequency_threshold=0.3,  # keep pixels invariant in >30% of evaluations
     min_observations=2,                   # floor so 1-2 lucky observations can't qualify
     downsample_targets=False,      # True to search for targets/fit corrections at reduced resolution
     downsample_resolution_m=15.0,  # only used when downsample_targets=True
