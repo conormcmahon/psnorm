@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import shutil
 
@@ -570,3 +571,12 @@ def test_run_pipeline_with_a_composite_reference(tmp_path):
     assert not os.path.exists(pipeline._model_path(str(output_dir), "solstice_2020"))
     flags = masking.load_flags_window(pipeline._flags_path(str(output_dir), "solstice_2020"), (0, 0, size, size))
     assert (flags[:, :3] & masking.EXCLUDE_NODATA).all() and not flags[:, 3:].any()
+
+    # The all-consensus-pixel fit quality recorded in the model is what
+    # consensus_fit_quality_all recomputes from the run's saved outputs.
+    scene = next(sc for sc in io.discover_scenes(str(input_dir)) if sc.scene_id == "20200601_120000_a")
+    recomputed = pipeline.consensus_fit_quality_all(str(output_dir), scene.scene_id, scene.analytic_path)
+    assert set(recomputed) == {b.band_name for b in model.bands}
+    for band in model.bands:
+        assert not math.isnan(band.r2_all)
+        assert recomputed[band.band_name] == pytest.approx((band.r2_all, band.rmse_before_all, band.rmse_after_all))

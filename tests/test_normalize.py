@@ -493,3 +493,34 @@ def test_compute_spectral_coverage_handles_no_target_pixels(tmp_path):
     assert r.n_target_pixels == 0
     assert math.isnan(r.target_variance)
     assert math.isnan(r.coverage_fraction)
+
+
+def test_fit_quality_all_covers_every_consensus_pixel_not_just_inliers(tmp_path):
+    # 55% contamination: RANSAC fits the clean minority, so the inlier-only
+    # r2/rmse look good while the all-pixel versions must show the mess.
+    size = 20
+    ref_path, tgt_path = _make_ref_tgt_rasters(tmp_path, size, 1.05, 5.0, list(range(220)), 2.0, base=1000.0)
+    model = normalize.fit_regression_from_mask(
+        ref_path, tgt_path, "ref_scene", "tgt_scene",
+        (0, 0, size, size), (0, 0, size, size), [1], [1], ["nir"], np.ones((size, size), dtype=bool),
+        invariance_frequency_threshold=0.5, min_observations=1, min_fit_pixels=2,
+    )
+    band = model.band("nir")
+    assert band.r2 > 0.99
+    assert band.r2_all < band.r2
+    assert band.rmse_after_all > 10 * band.rmse_after
+    # the all-pixel numbers are exactly fit_quality over every consensus pixel
+    tgt, ref, _ = normalize.collect_consensus_pairs(ref_path, tgt_path, (0, 0, size, size), (0, 0, size, size),
+                                                   [1], [1], np.ones((size, size), dtype=bool))
+    assert tgt[0].size == size * size
+    expected = normalize.fit_quality(tgt[0], ref[0], band.slope, band.intercept)
+    assert (band.r2_all, band.rmse_before_all, band.rmse_after_all) == pytest.approx(expected)
+
+
+def test_fit_quality():
+    x = np.array([0.0, 1.0, 2.0, 3.0])
+    y = 2.0 * x + 1.0
+    r2, before, after = normalize.fit_quality(x, y, 2.0, 1.0)
+    assert r2 == pytest.approx(1.0) and after == pytest.approx(0.0)
+    assert before == pytest.approx(np.sqrt(np.mean((x - y) ** 2)))
+    assert all(np.isnan(v) for v in normalize.fit_quality(x[:1], y[:1], 1.0, 0.0))

@@ -98,6 +98,22 @@ def fit_orthogonal_regression(x: np.ndarray, y: np.ndarray) -> tuple[float, floa
     return slope, intercept, r2
 
 
+def fit_quality(x: np.ndarray, y: np.ndarray, slope: float, intercept: float) -> tuple[float, float, float]:
+    """(r2, rmse_before, rmse_after) of target `x` against reference `y`:
+    r2 is the squared Pearson correlation (as fit_orthogonal_regression
+    reports it), rmse_before is RMSE(x - y) and rmse_after is
+    RMSE(intercept + slope*x - y). NaN for fewer than 2 points."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if x.size < 2:
+        return float("nan"), float("nan"), float("nan")
+    sx, sy = x.std(), y.std()
+    r2 = float(np.corrcoef(x, y)[0, 1] ** 2) if sx > 0 and sy > 0 else 0.0
+    rmse_before = float(np.sqrt(np.mean((x - y) ** 2)))
+    rmse_after = float(np.sqrt(np.mean((intercept + slope * x - y) ** 2)))
+    return r2, rmse_before, rmse_after
+
+
 @dataclass
 class BandModel:
     band_name: str
@@ -115,6 +131,15 @@ class BandModel:
     fallback_reason: str | None = None  # why, e.g. "too few pixels" or "slope outside bounds" -- None if not
     raw_slope: float | None = None      # the fitted (RANSAC) slope/intercept *before* the fallback decision,
     raw_intercept: float | None = None  # only populated when identity_fallback is True (else redundant with slope/intercept)
+    # The same three diagnostics over ALL of the fit's consensus pixels (the
+    # consensus pixels clear in both search masks, before RANSAC trimming),
+    # for the same fitted line. RANSAC keeps only points near a line, so the
+    # inlier-only r2/rmse can look good even when most consensus pixels are
+    # far from linear; these show that. NaN for models fitted before they
+    # were recorded (see pipeline.consensus_fit_quality_all to recompute).
+    r2_all: float = float("nan")
+    rmse_before_all: float = float("nan")
+    rmse_after_all: float = float("nan")
 
 
 @dataclass
@@ -521,6 +546,81 @@ def _ransac_orthogonal_regression(
     return x[best_mask], y[best_mask], int((~best_mask).sum()), best_mask
 
 
+def collect_consensus_pairs(
+    reference_path: str,
+    target_path: str,
+    ref_window: io.Window,
+    tgt_window: io.Window,
+    band_indices_ref: list[int],
+    band_indices_tgt: list[int],
+    consensus_mask: np.ndarray,
+    *,
+    block_rows: int = io.DEFAULT_BLOCK_ROWS,
+    downsample_factor: int = 1,
+    return_positions: bool = False,
+) -> tuple[list[np.ndarray], list[np.ndarray], np.ndarray | None]:
+    """The (target, reference) value pairs a fit is made from: per band,
+    the target's and the reference's values at every pixel flagged True in
+    `consensus_mask` (cropped to `ref_window`'s shape), in row-major order.
+    Returns (target values per band, reference values per band, flat
+    row*xsize+col positions within ref_window, or None unless
+    `return_positions`). See fit_regression_from_mask for `downsample_factor`.
+    """
+    if downsample_factor > 1:
+        block_rows = max(downsample_factor, (block_rows // downsample_factor) * downsample_factor)
+    n_bands = len(band_indices_ref)
+    ref_ds, ref_bands = io.open_bands(reference_path, band_indices_ref)
+    tgt_ds, tgt_bands = io.open_bands(target_path, band_indices_tgt)
+    rxoff, ryoff, xsize, ysize = ref_window
+    txoff, tyoff, _, _ = tgt_window
+
+    # Per-band raw (target, reference) value pairs at consensus locations --
+    # bounded by the (deliberately sparse) consensus pixel count, not scene
+    # size, so materializing them in memory (rather than only streaming
+    # sufficient statistics) is cheap and lets outlier removal see actual
+    # residuals/robust scale, not just accumulated sums.
+    tgt_values: list[list[np.ndarray]] = [[] for _ in range(n_bands)]
+    ref_values: list[list[np.ndarray]] = [[] for _ in range(n_bands)]
+    # Flat (row*xsize + col) position within ref_window for every collected
+    # point -- shared across all bands (built from the same `invariant`
+    # selection each block), only materialized when the caller wants inlier
+    # rasters back (return_positions). Lets a band's final RANSAC inlier_mask
+    # (an index into this same per-band point ordering) be mapped back to
+    # actual pixel locations.
+    positions: list[np.ndarray] = []
+
+    # See irmad._load_window_cache's identical pattern: computed once from
+    # the reference window so every target scene's coarse-cell grid lands
+    # at the same absolute positions on the reference grid, not phased
+    # independently per scene (see io.read_block_flat's docstring).
+    x_phase = rxoff % downsample_factor if downsample_factor > 1 else 0
+    y_phase = ryoff % downsample_factor if downsample_factor > 1 else 0
+
+    for row_off, n_rows in io.iter_row_blocks(ysize, block_rows):
+        invariant = consensus_mask[row_off : row_off + n_rows, :].ravel()
+        if not invariant.any():
+            continue
+        tile_ref = io.read_block_flat(
+            ref_bands, rxoff, ryoff + row_off, xsize, n_rows, downsample_factor, x_phase, y_phase,
+        )
+        tile_tgt = io.read_block_flat(
+            tgt_bands, txoff, tyoff + row_off, xsize, n_rows, downsample_factor, x_phase, y_phase,
+        )
+        if return_positions:
+            block_start = row_off * xsize
+            positions.append(np.arange(block_start, block_start + n_rows * xsize)[invariant])
+        for b in range(n_bands):
+            # target is x, reference is y: fits reference = a + b*target,
+            # the transform later applied to normalize target scenes.
+            tgt_values[b].append(tile_tgt[invariant, b])
+            ref_values[b].append(tile_ref[invariant, b])
+
+    ref_ds = tgt_ds = None
+    tgt_arrays = [np.concatenate(v) if v else np.empty(0) for v in tgt_values]
+    ref_arrays = [np.concatenate(v) if v else np.empty(0) for v in ref_values]
+    return tgt_arrays, ref_arrays, (np.concatenate(positions) if positions else None)
+
+
 def fit_regression_from_mask(
     reference_path: str,
     target_path: str,
@@ -601,59 +701,14 @@ def fit_regression_from_mask(
     is disabled (`outlier_abs_threshold_dn=None`), the mask is just the
     whole consensus set for that band.
     """
-    if downsample_factor > 1:
-        block_rows = max(downsample_factor, (block_rows // downsample_factor) * downsample_factor)
-
     n_bands = len(band_names)
-    ref_ds, ref_bands = io.open_bands(reference_path, band_indices_ref)
-    tgt_ds, tgt_bands = io.open_bands(target_path, band_indices_tgt)
-    rxoff, ryoff, xsize, ysize = ref_window
-    txoff, tyoff, _, _ = tgt_window
-
-    # Per-band raw (target, reference) value pairs at consensus locations --
-    # bounded by the (deliberately sparse) consensus pixel count, not scene
-    # size, so materializing them in memory (rather than only streaming
-    # sufficient statistics) is cheap and lets outlier removal see actual
-    # residuals/robust scale, not just accumulated sums.
-    tgt_values: list[list[np.ndarray]] = [[] for _ in range(n_bands)]
-    ref_values: list[list[np.ndarray]] = [[] for _ in range(n_bands)]
-    # Flat (row*xsize + col) position within ref_window for every collected
-    # point -- shared across all bands (built from the same `invariant`
-    # selection each block), only materialized when the caller wants inlier
-    # rasters back. Lets a band's final RANSAC inlier_mask (an index into
-    # this same per-band point ordering) be mapped back to actual pixel
-    # locations for return_inlier_masks.
-    positions: list[np.ndarray] = []
-    n_consensus_pixels = 0
-
-    # See irmad._load_window_cache's identical pattern: computed once from
-    # the reference window so every target scene's coarse-cell grid lands
-    # at the same absolute positions on the reference grid, not phased
-    # independently per scene (see io.read_block_flat's docstring).
-    x_phase = rxoff % downsample_factor if downsample_factor > 1 else 0
-    y_phase = ryoff % downsample_factor if downsample_factor > 1 else 0
-
-    for row_off, n_rows in io.iter_row_blocks(ysize, block_rows):
-        invariant = consensus_mask[row_off : row_off + n_rows, :].ravel()
-        if not invariant.any():
-            continue
-        tile_ref = io.read_block_flat(
-            ref_bands, rxoff, ryoff + row_off, xsize, n_rows, downsample_factor, x_phase, y_phase,
-        )
-        tile_tgt = io.read_block_flat(
-            tgt_bands, txoff, tyoff + row_off, xsize, n_rows, downsample_factor, x_phase, y_phase,
-        )
-        n_consensus_pixels += int(invariant.sum())
-        if return_inlier_masks:
-            block_start = row_off * xsize
-            positions.append(np.arange(block_start, block_start + n_rows * xsize)[invariant])
-        for b in range(n_bands):
-            # target is x, reference is y: fits reference = a + b*target,
-            # the transform later applied to normalize target scenes.
-            tgt_values[b].append(tile_tgt[invariant, b])
-            ref_values[b].append(tile_ref[invariant, b])
-
-    ref_ds = tgt_ds = None
+    _, _, xsize, ysize = ref_window
+    tgt_values, ref_values, position_concat = collect_consensus_pairs(
+        reference_path, target_path, ref_window, tgt_window, band_indices_ref, band_indices_tgt,
+        consensus_mask, block_rows=block_rows, downsample_factor=downsample_factor,
+        return_positions=return_inlier_masks,
+    )
+    n_consensus_pixels = int(tgt_values[0].size) if n_bands else 0
 
     if n_consensus_pixels < 2:
         raise ValueError(
@@ -664,13 +719,11 @@ def fit_regression_from_mask(
             f"overlap/masking for this scene pair."
         )
 
-    position_concat = np.concatenate(positions) if positions else None
-
     band_models = []
     inlier_rasters: dict[str, np.ndarray] = {}
     for b, name in enumerate(band_names):
-        x = np.concatenate(tgt_values[b])
-        y = np.concatenate(ref_values[b])
+        x = x_all = tgt_values[b]
+        y = y_all = ref_values[b]
 
         n_outliers = 0
         inlier_mask = np.ones(x.size, dtype=bool)
@@ -686,6 +739,7 @@ def fit_regression_from_mask(
         rmse_before = float(np.sqrt(np.mean((x - y) ** 2)))
         fitted_slope, fitted_intercept, r2 = fit_orthogonal_regression(x, y)
         rmse_after = float(np.sqrt(np.mean((fitted_intercept + fitted_slope * x - y) ** 2)))
+        r2_all, rmse_before_all, rmse_after_all = fit_quality(x_all, y_all, fitted_slope, fitted_intercept)
 
         fallback_reason = None
         if x.size < min_fit_pixels:
@@ -705,6 +759,7 @@ def fit_regression_from_mask(
             n_outliers_excluded=n_outliers, rmse_before=rmse_before, rmse_after=rmse_after,
             identity_fallback=fallback_reason is not None, fallback_reason=fallback_reason,
             raw_slope=raw_slope, raw_intercept=raw_intercept,
+            r2_all=r2_all, rmse_before_all=rmse_before_all, rmse_after_all=rmse_after_all,
         ))
 
         if return_inlier_masks:

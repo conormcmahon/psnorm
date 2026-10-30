@@ -593,6 +593,60 @@ def _ransac_inliers_path(output_dir: str, scene_id: str, band_name: str) -> str:
     return os.path.join(output_dir, "ransac_inliers", f"{scene_id}_{band_name}.tif")
 
 
+def reference_raster_path(output_dir: str) -> str:
+    """The reference raster a composite-reference run fitted against (the
+    VRT in output_dir/reference/)."""
+    ref_dir = os.path.join(output_dir, "reference")
+    vrts = sorted(n for n in os.listdir(ref_dir) if n.endswith(".vrt")) if os.path.isdir(ref_dir) else []
+    if len(vrts) != 1:
+        raise ValueError(f"expected one reference .vrt in {ref_dir}, found {vrts}")
+    return os.path.join(ref_dir, vrts[0])
+
+
+def consensus_fit_quality_all(
+    output_dir: str, scene_id: str, target_path: str, *, block_rows: int = io.DEFAULT_BLOCK_ROWS,
+) -> dict[str, tuple[float, float, float]]:
+    """{band name: (r2_all, rmse_before_all, rmse_after_all)} for a scene
+    already fitted in `output_dir`, recomputed from its saved outputs for
+    models saved before BandModel recorded them: the fit's own pixels (the
+    consensus pixels clear in both search masks, as _finalize_target_scene
+    selects them) read from `target_path` -- the file the fit read, i.e. the
+    scene's preferred imagery -- and the reference, scored against the
+    band's fitted line (raw_slope/raw_intercept where the band fell back to
+    the identity). See normalize.fit_quality. Assumes the run did not
+    downsample targets (the pipeline's default). Raises ValueError if the
+    pixel count differs from the model's n_consensus_pixels (i.e. the inputs
+    are not the ones the fit used)."""
+    model = model_io.load_model(_model_path(output_dir, scene_id))
+    stats = model_io.load_json(_candidate_stats_path(output_dir, scene_id))
+    ref_window, tgt_window = tuple(stats["ref_window"]), tuple(stats["tgt_window"])
+    reference_path = reference_raster_path(output_dir)
+    reference_band_names = sensors.detect_band_names(reference_path)
+    target_band_names = sensors.detect_band_names(target_path)
+    fitted = [b for b in model.bands if b.band_name in reference_band_names and b.n_invariant_pixels > 0]
+    names = [b.band_name for b in fitted]
+
+    mask = masking.load_flags_window(os.path.join(output_dir, "consensus", "consensus_mask.tif"), ref_window) != 0
+    mask &= masking.load_flags_window(_search_mask_path(output_dir, scene_id), tgt_window) == 0
+    mask &= masking.load_flags_window(_search_mask_path(output_dir, model.reference_id), ref_window) == 0
+    tgt_values, ref_values, _ = normalize.collect_consensus_pairs(
+        reference_path, target_path, ref_window, tgt_window,
+        [sensors.band_index(reference_band_names, n) for n in names],
+        [sensors.band_index(target_band_names, n) for n in names],
+        mask, block_rows=block_rows,
+    )
+    n = int(tgt_values[0].size) if names else 0
+    if names and n != model.n_consensus_pixels:
+        raise ValueError(f"{scene_id}: {n} consensus pixels found, but the model was fitted on "
+                         f"{model.n_consensus_pixels} (is {target_path} the file the fit read?)")
+    out = {}
+    for band, x, y in zip(fitted, tgt_values, ref_values):
+        slope, intercept = ((band.raw_slope, band.raw_intercept) if band.identity_fallback and band.raw_slope is not None
+                            else (band.slope, band.intercept))
+        out[band.band_name] = normalize.fit_quality(x, y, slope, intercept)
+    return out
+
+
 def _compute_and_save_flags(scene: io.Scene, band_names: list[str], config: PipelineConfig) -> tuple[str, str]:
     """Compute (or reuse) a scene's exclusion-flags raster at its own full
     extent and save it under output_dir/masks/, along with the eroded/
